@@ -105,6 +105,11 @@ VANITY_RULES = {
     "AU": {"suffix": 0.95, "nines": True},  # xx9.95 closest
     # CA example: 89.36 -> 89.99
     "CA": {"suffix": 0.99, "nines": True},  # xx9.99 closest
+    # NZ: match AU convention xx9.95
+    "NZ": {"suffix": 0.95, "nines": True},
+},  # xx9.95 closest
+    # CA example: 89.36 -> 89.99
+    "CA": {"suffix": 0.99, "nines": True},  # xx9.99 closest
 }
 
 # -----------------------------
@@ -192,9 +197,9 @@ def fetch_steam_price(appid: str, cc: str, forced_title: Optional[str] = None) -
     except Exception:
         return None
 
-
 # -----------------------------
 # Xbox Fetcher (displaycatalog / storesdk)
+# ----------------------------- (displaycatalog / storesdk)
 # -----------------------------
 STORESDK_URL = "https://storeedgefd.dsx.mp.microsoft.com/v9.0/sdk/products"
 DISPLAYCATALOG_URL = "https://displaycatalog.mp.microsoft.com/v7.0/products"
@@ -403,25 +408,71 @@ with st.sidebar:
 # Execute & Display
 # -----------------------------
 if run:
+    # --- Fast concurrent fetching (Steam + Xbox in parallel) ---
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def steam_jobs():
+        for cc in markets:
+            for title in BASKET_TITLES:
+                appid = STEAM_APPIDS.get(title)
+                if appid:
+                    yield ("steam", cc, title, appid)
+
+    def xbox_jobs():
+        for cc in markets:
+            for title in BASKET_TITLES:
+                pid = XBOX_PRODUCT_IDS.get(title)
+                if pid:
+                    yield ("xbox", cc, title, pid)
+
+    rows: List[PriceRow] = []
+
     with st.status("Pulling prices across markets…", expanded=False) as status:
-        raw_df, xbox_df, steam_df = compute_recommendations(markets)
-        if raw_df.empty:
+        futures = []
+        # Limit workers to be gentle; we still get a large speedup vs serial
+        with ThreadPoolExecutor(max_workers=14) as ex:
+            for kind, cc, title, val in list(steam_jobs()) + list(xbox_jobs()):
+                if kind == "steam":
+                    futures.append(ex.submit(fetch_steam_price, val, cc, title))
+                else:
+                    futures.append(ex.submit(fetch_xbox_price, title, val, cc))
+            for f in as_completed(futures):
+                r = f.result()
+                if r:
+                    rows.append(normalize_row(r))
+        if not rows:
             status.update(label="No data returned — check IDs or try fewer markets.", state="error")
             st.stop()
         status.update(label="Done!", state="complete")
+
+    raw_df = pd.DataFrame([asdict(r) for r in rows])
+
+    # Compute recommendations
+    reco = (
+        raw_df.groupby(["platform", "country", "currency"], dropna=False)["price"].mean().reset_index().rename(columns={"price": "RecommendedPrice"})
+    )
+
+    reco_xbox = reco[reco["platform"] == "Xbox"]["country currency RecommendedPrice".split()].reset_index(drop=True)
+    reco_steam = reco[reco["platform"] == "Steam"]["country currency RecommendedPrice".split()].reset_index(drop=True)
+
+    # Vanity rounding
+    if not reco_xbox.empty:
+        reco_xbox["RecommendedPrice"] = [apply_vanity(c, p) for c, p in zip(reco_xbox["country"], reco_xbox["RecommendedPrice"])]
+    if not reco_steam.empty:
+        reco_steam["RecommendedPrice"] = [apply_vanity(c, p) for c, p in zip(reco_steam["country"], reco_steam["RecommendedPrice"])]
 
     st.subheader("Raw Basket Rows (after normalization)")
     st.dataframe(raw_df)
 
     st.subheader("Price Recommendations — Xbox (per country)")
-    st.dataframe(xbox_df)
+    st.dataframe(reco_xbox)
 
     st.subheader("Price Recommendations — Steam (per country)")
-    st.dataframe(steam_df)
+    st.dataframe(reco_steam)
 
     merged = pd.merge(
-        xbox_df.rename(columns={"RecommendedPrice": "XboxRecommended"}),
-        steam_df.rename(columns={"RecommendedPrice": "SteamRecommended"}),
+        reco_xbox.rename(columns={"RecommendedPrice": "XboxRecommended"}),
+        reco_steam.rename(columns={"RecommendedPrice": "SteamRecommended"}),
         on=["country", "currency"],
         how="outer",
     ).sort_values(["country"]).reset_index(drop=True)
@@ -449,7 +500,14 @@ else:
 with st.expander("Implementation Notes & Caveats"):
     st.markdown(
         """
-        - **Steam** uses the official Store endpoint `api/appdetails` with `filters=price_overview` and prefers `initial` (MSRP) when available.
+        - **Steam**: `api/appdetails` with `filters=price_overview`; prefers `initial` (MSRP) when present.
+        - **Xbox**: Prefers `MSRP` over `ListPrice`; tries localized locales (e.g., `en-AU`, `en-NZ`, `es-MX`) then falls back to `en-US`.
+        - **HELLDIVERS 2 scaling**: `(local_price / 4) * 7`.
+        - **Composite**: Mean of basket items by platform/country.
+        - **Vanity rounding**: AU & NZ → nearest **xx9.95**; CA → **xx9.99**. Extend via `VANITY_RULES`.
+        - **Performance**: Uses concurrent fetching (thread pool). If you see throttling, reduce `max_workers`.
+        """
+    ) when available.
         - **Xbox**: Prefer `MSRP` over `ListPrice` to avoid picking sale prices (e.g., MX 699 vs 1399). Also tries localized locales (e.g., `en-AU`, `es-MX`) and falls back to `en-US`.
         - **HELLDIVERS 2 scaling**: For each country, `(local_price / 4) * 7`.
         - **Composite**: Simple mean of available basket items by platform/country.
