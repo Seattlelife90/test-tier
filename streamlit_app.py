@@ -3,8 +3,9 @@
 # AAA Pricing Tier Composer for Xbox + Steam (All Markets)
 # - Pulls live prices from Steam (store.steampowered.com API)
 # - Pulls live prices from Xbox Store (displaycatalog / storesdk endpoints)
-# - Normalizes Helldivers 2 by (local_price / 4) * 7 to scale $39.99 -> $69.99 equivalent
+# - Normalizes HELLDIVERS 2 by (local_price / 4) * 7 to scale $39.99 -> $69.99 equivalent
 # - Computes composite per-country recommendations separately for Xbox and Steam
+# - Applies vanity pricing rules (e.g., AU: xx9.95, CA: xx9.99) to recommendations
 # - Exports a CSV and shows interactive tables in UI
 # ------------------------------------------------------------
 
@@ -29,7 +30,7 @@ st.set_page_config(
 
 st.title("🎮 AAA Tier Pricing Composer — Xbox + Steam (All Markets)")
 st.caption(
-    "Live pulls from Steam (Store API) and Xbox Store. Helldivers 2 is scaled by (price/4)*7 to normalize to a $69.99 basket."
+    "Live pulls from Steam (Store API) and Xbox Store. HELLDIVERS 2 is scaled by (price/4)*7 to normalize to a $69.99 basket."
 )
 
 # -----------------------------
@@ -48,34 +49,33 @@ class PriceRow:
 # -----------------------------
 # Constants / Defaults
 # -----------------------------
-# Steam appids for our basket games (validated as of 2025-09-29)
+# Steam appids for our basket games
 STEAM_APPIDS: Dict[str, str] = {
     "The Outer Worlds 2": "1449110",
     "Madden NFL 26": "3230400",
     "Call of Duty: Black Ops 6": "2933620",
     "NBA 2K26": "3472040",
     "Borderlands 4": "1285190",
-    "HELLDIVERS 2": "553850",  # note: will be scaled in normalization
+    "HELLDIVERS 2": "553850",  # scaled in normalization
 }
 
-# Xbox Store product IDs (StoreId / BigId in page URLs); standard/base editions where possible
+# Xbox Store product IDs (StoreId / BigId)
 XBOX_PRODUCT_IDS: Dict[str, str] = {
     "The Outer Worlds 2": "9P8RMKXRML7D",
     "Madden NFL 26": "9NVD16NP4J8T",  # alt listing seen: 9PGVZ5XPQ9SP — app tries both
-    "Call of Duty: Black Ops 6": "9PNCL2R6G8D0",  # Windows listing shown in URL; used for price where available
+    "Call of Duty: Black Ops 6": "9PNCL2R6G8D0",
     "NBA 2K26": "9NFKCJNBR34N",
     "Borderlands 4": "9MX6HKF5647G",
-    "HELLDIVERS 2": "9P3PT7PQJD0M",  # Xbox Series X|S
+    "HELLDIVERS 2": "9P3PT7PQJD0M",
 }
 
-# If a product id appears to vary by edition/PC/console, the fetcher will try known alternates here
+# Aliases (if a product id varies by edition/PC/console)
 XBOX_PRODUCT_ALIASES: Dict[str, List[str]] = {
     "Madden NFL 26": ["9NVD16NP4J8T", "9PGVZ5XPQ9SP"],
     "Call of Duty: Black Ops 6": ["9PNCL2R6G8D0"],
 }
 
-# Markets: "all available" — curated set commonly supported by both platforms
-# You can paste a custom list in the sidebar if desired.
+# Markets: broad set commonly supported by both platforms
 ALL_MARKETS: List[str] = [
     # Americas
     "US","CA","MX","BR","AR","CL","CO","PE","UY","PY","EC","BO","CR","PA","DO","GT","HN","NI","SV","JM","TT","BS","BZ","BB","AW","AG","AI","BM","KY","MQ","GP","GF",
@@ -87,8 +87,25 @@ ALL_MARKETS: List[str] = [
     "JP","KR","TW","HK","SG","MY","TH","ID","PH","VN","IN","AU","NZ"
 ]
 
-# Zero-decimal currencies (no minor unit) — for display/formatting if detected
+# Zero-decimal currencies
 ZERO_DEC_CURRENCIES = {"JPY", "KRW", "VND", "CLP", "ISK"}
+
+# Locale override per market (helps Xbox availability)
+LOCALE_BY_MARKET: Dict[str, str] = {
+    "US": "en-US", "CA": "en-CA", "GB": "en-GB", "AU": "en-AU", "NZ": "en-NZ",
+    "MX": "es-MX", "BR": "pt-BR", "AR": "es-AR", "CL": "es-CL", "CO": "es-CO",
+    "FR": "fr-FR", "DE": "de-DE", "IT": "it-IT", "ES": "es-ES", "PT": "pt-PT",
+    "NL": "nl-NL", "BE": "nl-BE", "LU": "fr-LU", "IE": "en-IE",
+    "JP": "ja-JP", "KR": "ko-KR", "TW": "zh-TW", "HK": "zh-HK", "SG": "en-SG",
+}
+
+# Vanity pricing rules per country
+VANITY_RULES = {
+    # AU example: 99.63 -> 99.95
+    "AU": {"suffix": 0.95, "nines": True},  # xx9.95 closest
+    # CA example: 89.36 -> 89.99
+    "CA": {"suffix": 0.99, "nines": True},  # xx9.99 closest
+}
 
 # -----------------------------
 # Helpers
@@ -106,6 +123,35 @@ def format_price(amount: Optional[float], currency: Optional[str]) -> str:
     if currency.upper() in ZERO_DEC_CURRENCIES:
         return f"{int(round(amount)):,} {currency.upper()}"
     return f"{amount:,.2f} {currency.upper()}"
+
+
+def locale_for_market(market: str) -> str:
+    return LOCALE_BY_MARKET.get(market.upper(), "en-US")
+
+
+# Vanity rounding utilities
+
+def _nearest_x9_suffix(price: float, cents_suffix: float) -> float:
+    """Return the number closest to price that ends with 9.cents_suffix (e.g., 9.95 or 9.99)."""
+    # consider candidates around the tens block of price
+    base_tens = int(price // 10)
+    candidates = []
+    for k in range(base_tens - 2, base_tens + 3):
+        cand = 10 * k + 9 + cents_suffix
+        if cand > 0:
+            candidates.append(cand)
+    # choose candidate with minimal absolute diff; tie -> higher price (lean to up)
+    best = min(candidates, key=lambda x: (abs(x - price), -x))
+    return round(best, 2)
+
+
+def apply_vanity(country: str, price: float) -> float:
+    rule = VANITY_RULES.get(country.upper())
+    if not rule:
+        return round(price, 2)
+    if rule.get("nines") and isinstance(rule.get("suffix"), float):
+        return _nearest_x9_suffix(float(price), float(rule["suffix"]))
+    return round(price, 2)
 
 
 # -----------------------------
@@ -150,15 +196,11 @@ def fetch_steam_price(appid: str, cc: str, forced_title: Optional[str] = None) -
 # -----------------------------
 # Xbox Fetcher (displaycatalog / storesdk)
 # -----------------------------
-# We'll try the newer storesdk endpoint first; if it fails, fallback to displaycatalog v7.0
-# Note: Some requests may require the MS-CV header; we include a random value.
-
 STORESDK_URL = "https://storeedgefd.dsx.mp.microsoft.com/v9.0/sdk/products"
 DISPLAYCATALOG_URL = "https://displaycatalog.mp.microsoft.com/v7.0/products"
 
 
 def _ms_cv() -> str:
-    # lightweight CV token (opaque) — not authenticated
     alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
     return "".join(random.choice(alphabet) for _ in range(24))
 
@@ -168,18 +210,17 @@ def _parse_xbox_price_from_products(payload: dict) -> Tuple[Optional[float], Opt
         products = payload.get("Products") or payload.get("products")
         if not products:
             return None, None
-        # Walk the first product's first availability price
         p0 = products[0]
         dsa = p0.get("DisplaySkuAvailabilities") or p0.get("displaySkuAvailabilities") or []
         if not dsa:
             return None, None
-        # choose the first SKU availability that has a price
         for sku in dsa:
             avs = sku.get("Availabilities") or sku.get("availabilities") or []
             for av in avs:
                 omd = av.get("OrderManagementData") or av.get("orderManagementData") or {}
                 price = omd.get("Price") or omd.get("price") or {}
-                amount = price.get("ListPrice") or price.get("listPrice") or price.get("MSRP") or price.get("msrp")
+                # Prefer MSRP over ListPrice to avoid sale prices (e.g., MX 699 vs 1399)
+                amount = price.get("MSRP") or price.get("msrp") or price.get("ListPrice") or price.get("listPrice")
                 currency = price.get("CurrencyCode") or price.get("currencyCode")
                 if amount:
                     try:
@@ -191,7 +232,7 @@ def _parse_xbox_price_from_products(payload: dict) -> Tuple[Optional[float], Opt
         return None, None
 
 
-def fetch_xbox_price_one_market(product_id: str, market: str, locale: str = "en-US") -> Optional[Tuple[float, str]]:
+def fetch_xbox_price_one_market(product_id: str, market: str, locale: str) -> Optional[Tuple[float, str]]:
     headers = {"MS-CV": _ms_cv(), "Accept": "application/json"}
     # Try storesdk v9
     try:
@@ -216,11 +257,27 @@ def fetch_xbox_price_one_market(product_id: str, market: str, locale: str = "en-
     return None
 
 
-def fetch_xbox_price(product_name: str, product_id: str, market: str, locale: str = "en-US") -> Optional[PriceRow]:
-    # Try aliases if present (some titles have multiple IDs for regions/editions)
+def fetch_xbox_price(product_name: str, product_id: str, market: str) -> Optional[PriceRow]:
+    # Try a localized locale for the market; fallback to en-US
+    loc = locale_for_market(market)
     ids_to_try = [product_id] + XBOX_PRODUCT_ALIASES.get(product_name, [])[1:]
+    # Attempt with localized locale first
     for pid in ids_to_try:
-        got = fetch_xbox_price_one_market(pid, market=market, locale=locale)
+        got = fetch_xbox_price_one_market(pid, market=market, locale=loc)
+        if got:
+            amount, ccy = got
+            return PriceRow(
+                platform="Xbox",
+                title=product_name,
+                country=market.upper(),
+                currency=ccy.upper() if ccy else None,
+                price=float(amount),
+                source_url=f"https://www.xbox.com/{loc.split('-')[0]}/games/store/placeholder/{pid}",
+            )
+        _sleep_human(0.3, 0.7)
+    # Fallback try with en-US locale in case localized one fails for certain regions
+    for pid in ids_to_try:
+        got = fetch_xbox_price_one_market(pid, market=market, locale="en-US")
         if got:
             amount, ccy = got
             return PriceRow(
@@ -231,6 +288,7 @@ def fetch_xbox_price(product_name: str, product_id: str, market: str, locale: st
                 price=float(amount),
                 source_url=f"https://www.xbox.com/en-US/games/store/placeholder/{pid}",
             )
+        _sleep_human(0.3, 0.7)
     return None
 
 
@@ -244,12 +302,12 @@ BASKET_TITLES = [
     "Call of Duty: Black Ops 6",
     "NBA 2K26",
     "Borderlands 4",
-    "HELLDIVERS 2",  # will be scaled
+    "HELLDIVERS 2",  # scaled
 ]
 
 
 def normalize_row(row: PriceRow) -> PriceRow:
-    """Apply Helldivers scaling (price/4)*7 if applicable. Others pass-through."""
+    """Apply HELLDIVERS scaling (price/4)*7 if applicable. Others pass-through."""
     if row.title.strip().lower().startswith("helldivers 2"):
         try:
             if row.price is not None:
@@ -270,7 +328,7 @@ def compute_recommendations(markets: List[str]) -> Tuple[pd.DataFrame, pd.DataFr
     """Returns: (raw_rows_df, per_country_reco_xbox, per_country_reco_steam)"""
     rows: List[PriceRow] = []
 
-    # Pull Steam first
+    # Pull Steam
     for cc in markets:
         for title in BASKET_TITLES:
             appid = STEAM_APPIDS.get(title)
@@ -287,7 +345,7 @@ def compute_recommendations(markets: List[str]) -> Tuple[pd.DataFrame, pd.DataFr
             pid = XBOX_PRODUCT_IDS.get(title)
             if not pid:
                 continue
-            r = fetch_xbox_price(title, product_id=pid, market=cc, locale="en-US")
+            r = fetch_xbox_price(title, product_id=pid, market=cc)
             if r:
                 rows.append(normalize_row(r))
             _sleep_human()
@@ -297,17 +355,20 @@ def compute_recommendations(markets: List[str]) -> Tuple[pd.DataFrame, pd.DataFr
     if df.empty:
         return df, pd.DataFrame(), pd.DataFrame()
 
-    # Compute per platform per country recommendations (mean of available items)
+    # Compute mean by platform/country/currency
     reco = (
-        df.groupby(["platform", "country", "currency"], dropna=False)["price"]
-        .mean()
-        .reset_index()
-        .rename(columns={"price": "RecommendedPrice"})
+        df.groupby(["platform", "country", "currency"], dropna=False)["price"].mean().reset_index().rename(columns={"price": "RecommendedPrice"})
     )
 
-    # Split into Xbox and Steam tables for clarity
+    # Split
     reco_xbox = reco[reco["platform"] == "Xbox"]["country currency RecommendedPrice".split()].reset_index(drop=True)
     reco_steam = reco[reco["platform"] == "Steam"]["country currency RecommendedPrice".split()].reset_index(drop=True)
+
+    # Apply vanity rounding rules
+    if not reco_xbox.empty:
+        reco_xbox["RecommendedPrice"] = [apply_vanity(c, p) for c, p in zip(reco_xbox["country"], reco_xbox["RecommendedPrice"])]
+    if not reco_steam.empty:
+        reco_steam["RecommendedPrice"] = [apply_vanity(c, p) for c, p in zip(reco_steam["country"], reco_steam["RecommendedPrice"])]
 
     return df, reco_xbox, reco_steam
 
@@ -352,20 +413,17 @@ if run:
     st.subheader("Raw Basket Rows (after normalization)")
     st.dataframe(raw_df)
 
-    # Two separate price recommendations per country
     st.subheader("Price Recommendations — Xbox (per country)")
     st.dataframe(xbox_df)
 
     st.subheader("Price Recommendations — Steam (per country)")
     st.dataframe(steam_df)
 
-    # Merge for one export with two columns if desired
     merged = pd.merge(
         xbox_df.rename(columns={"RecommendedPrice": "XboxRecommended"}),
         steam_df.rename(columns={"RecommendedPrice": "SteamRecommended"}),
         on=["country", "currency"],
         how="outer",
-        suffixes=("_Xbox", "_Steam"),
     ).sort_values(["country"]).reset_index(drop=True)
 
     st.subheader("Combined Recommendations (Xbox + Steam)")
@@ -386,17 +444,16 @@ else:
     )
 
 # -----------------------------
-# Notes / Caveats (shown collapsed in UI)
+# Notes / Caveats
 # -----------------------------
 with st.expander("Implementation Notes & Caveats"):
     st.markdown(
         """
-        - **Steam** uses the official Store endpoint `api/appdetails` with `filters=price_overview` (prefers `initial` cents when available).
-        - **Xbox** fetch tries the `storesdk` v9 endpoint first, then falls back to the `displaycatalog` v7 endpoint; both are public-facing endpoints used by Microsoft Store.
-        - **Helldivers 2 scaling**: For each country, we compute `(local_price / 4) * 7` to normalize the $39.99 title to a $69.99-equivalent contribution in the basket.
-        - **Composite method**: Simple mean of available basket items by platform/country. You can change this to median/trimmed mean easily.
-        - **Currency formatting**: Zero-decimal currencies (JPY/KRW/VND/CLP/ISK) are rendered without decimals; others use two decimals for display.
-        - **Throughput**: API calls are rate-limited with human sleeps. For very large market lists, consider increasing delays to reduce 429/ban risk.
-        - **Edits**: If any Xbox StoreId differs per region/edition, paste the desired ID(s) in the sidebar. The app attempts known aliases for a couple of titles.
+        - **Steam** uses the official Store endpoint `api/appdetails` with `filters=price_overview` and prefers `initial` (MSRP) when available.
+        - **Xbox**: Prefer `MSRP` over `ListPrice` to avoid picking sale prices (e.g., MX 699 vs 1399). Also tries localized locales (e.g., `en-AU`, `es-MX`) and falls back to `en-US`.
+        - **HELLDIVERS 2 scaling**: For each country, `(local_price / 4) * 7`.
+        - **Composite**: Simple mean of available basket items by platform/country.
+        - **Vanity rules**: AU → nearest **xx9.95**; CA → nearest **xx9.99**. Add more rules easily via `VANITY_RULES`.
+        - Consider increasing delays or slicing markets to avoid rate-limits for very large pulls.
         """
     )
