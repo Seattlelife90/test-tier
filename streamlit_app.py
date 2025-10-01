@@ -2,11 +2,12 @@
 # ------------------------------------------------------------
 # AAA Pricing Tier Composer (Xbox + Steam)
 # - Editable baskets (add/remove titles per platform)
-# - NEW: per-row scale_factor (e.g., 1.75 for 39.99→69.99, 1.4 for 49.99→69.99)
+# - Per-row scale_factor (e.g., 1.75 for 39.99→69.99, 1.4 for 49.99→69.99)
 # - Weighted recommendations using the "weight" column
 # - Platform-specific market codes (Steam cc vs Xbox locale)
 # - Steam fallback to packagedetails when price_overview is missing
 # - Xbox MSRP preference, locale-first + en-US fallback
+# - NEW: data editor persists automatically; Validate & Auto‑fill for Steam/Xbox
 # - Parallel fetching, diagnostics, country_name column, CSV export
 # ------------------------------------------------------------
 
@@ -72,20 +73,20 @@ def xbox_locale_for(market: str) -> str:
     return fallback.get(market.upper(), "en-us")
 
 DEFAULT_STEAM_ROWS = [
-    {"include": True, "title": "The Outer Worlds 2", "appid": "1449110", "scale_factor": 1.0, "weight": 1.0},
-    {"include": True, "title": "Madden NFL 26", "appid": "3230400", "scale_factor": 1.0, "weight": 1.0},
-    {"include": True, "title": "Call of Duty: Black Ops 6", "appid": "2933620", "scale_factor": 1.0, "weight": 1.0},
-    {"include": True, "title": "NBA 2K26", "appid": "3472040", "scale_factor": 1.0, "weight": 1.0},
-    {"include": True, "title": "Borderlands 4", "appid": "1285190", "scale_factor": 1.0, "weight": 1.0},
-    {"include": True, "title": "HELLDIVERS 2", "appid": "553850", "scale_factor": 1.75, "weight": 1.0},
+    {"include": True, "title": "The Outer Worlds 2", "appid": "1449110", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
+    {"include": True, "title": "Madden NFL 26", "appid": "3230400", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
+    {"include": True, "title": "Call of Duty: Black Ops 6", "appid": "2933620", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
+    {"include": True, "title": "NBA 2K26", "appid": "3472040", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
+    {"include": True, "title": "Borderlands 4", "appid": "1285190", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
+    {"include": True, "title": "HELLDIVERS 2", "appid": "553850", "scale_factor": 1.75, "weight": 1.0, "_steam_error": ""},
 ]
 DEFAULT_XBOX_ROWS = [
-    {"include": True, "title": "The Outer Worlds 2", "store_id": "9NSPRSXXZZLG", "scale_factor": 1.0, "weight": 1.0},
-    {"include": True, "title": "Madden NFL 26", "store_id": "9NVD16NP4J8T", "scale_factor": 1.0, "weight": 1.0},
-    {"include": True, "title": "Call of Duty: Black Ops 6", "store_id": "9PNCL2R6G8D0", "scale_factor": 1.0, "weight": 1.0},
-    {"include": True, "title": "NBA 2K26", "store_id": "9PJ2RVRC0L1X", "scale_factor": 1.0, "weight": 1.0},
-    {"include": True, "title": "Borderlands 4", "store_id": "9MX6HKF5647G", "scale_factor": 1.0, "weight": 1.0},
-    {"include": True, "title": "HELLDIVERS 2", "store_id": "9P3PT7PQJD0M", "scale_factor": 1.75, "weight": 1.0},
+    {"include": True, "title": "The Outer Worlds 2", "store_id": "9NSPRSXXZZLG", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
+    {"include": True, "title": "Madden NFL 26", "store_id": "9NVD16NP4J8T", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
+    {"include": True, "title": "Call of Duty: Black Ops 6", "store_id": "9PNCL2R6G8D0", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
+    {"include": True, "title": "NBA 2K26", "store_id": "9PJ2RVRC0L1X", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
+    {"include": True, "title": "Borderlands 4", "store_id": "9MX6HKF5647G", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
+    {"include": True, "title": "HELLDIVERS 2", "store_id": "9P3PT7PQJD0M", "scale_factor": 1.75, "weight": 1.0, "_xbox_error": ""},
 ]
 
 VANITY_RULES = {"AU":{"suffix":0.95,"nines":True},"NZ":{"suffix":0.95,"nines":True},"CA":{"suffix":0.99,"nines":True}}
@@ -237,6 +238,54 @@ def fetch_xbox_price(product_name: str, product_id: str, market_iso: str) -> Tup
         return PriceRow("Xbox", product_name, market_iso.upper(), ccy.upper() if ccy else None, float(amt), f"https://www.xbox.com/en-US/games/store/placeholder/{product_id}"), None
     return None, MissRow("Xbox", product_name, market_iso, "no_price_entries")
 
+# Validators
+def validate_and_fill_steam_rows(rows: List[dict]) -> List[dict]:
+    updated = []
+    for r in rows:
+        appid = str(r.get("appid") or "").strip()
+        if not appid.isdigit():
+            r["_steam_error"] = "appid must be numeric"
+            updated.append(r); continue
+        data = _steam_appdetails(appid, cc="US")
+        if not data:
+            r["_steam_error"] = "not found on Steam API"
+        else:
+            r["_steam_error"] = ""
+            if not r.get("title"):
+                r["title"] = data.get("name") or r.get("title")
+        updated.append(r)
+    return updated
+
+def validate_and_fill_xbox_rows(rows: List[dict]) -> List[dict]:
+    updated = []
+    headers = {"MS-CV": _ms_cv(), "Accept": "application/json"}
+    for r in rows:
+        store_id = str(r.get("store_id") or "").strip()
+        if len(store_id) != 12 or not store_id.upper().startswith("9"):
+            r["_xbox_error"] = "store_id should be 12 chars (usually starts with 9)"
+            updated.append(r); continue
+        try:
+            resp = requests.get(
+                DISPLAYCATALOG_URL,
+                params={"bigIds": store_id, "market": "US", "languages": "en-US", "fieldsTemplate": "Details"},
+                headers=headers, timeout=12,
+            )
+            j = resp.json() if resp.status_code == 200 else {}
+            products = j.get("Products") or j.get("products") or []
+            if not products:
+                r["_xbox_error"] = "not found on Xbox catalog"
+            else:
+                r["_xbox_error"] = ""
+                if not r.get("title"):
+                    lp = (products[0].get("LocalizedProperties") or products[0].get("localizedProperties") or [])
+                    if lp and lp[0].get("ProductTitle"):
+                        r["title"] = lp[0]["ProductTitle"]
+        except Exception:
+            r["_xbox_error"] = "lookup error"
+        updated.append(r)
+    return updated
+
+# Sidebar / editors
 with st.sidebar:
     st.header("Controls")
     default_markets = ",".join(sorted(COUNTRY_NAMES.keys()))
@@ -246,7 +295,7 @@ with st.sidebar:
     st.markdown("""**Scale factor help**  
 - Leave **1.0** for no scaling.  
 - **39.99 → 69.99** ⇒ **1.75** (7 ÷ 4)  
-- **49.99 → 69.99** ⇒ **1.4**  (7 ÷ 5)  
+- **49.99 → 69.99** ⇒ **1.40** (7 ÷ 5)  
 *General rule: scale_factor = target_base ÷ source_base.*""")
 
     if "steam_rows" not in st.session_state:
@@ -265,11 +314,20 @@ with st.sidebar:
             "title":   st.column_config.TextColumn(),
             "appid":   st.column_config.TextColumn(),
             "scale_factor": st.column_config.NumberColumn(step=0.05, min_value=0.0, max_value=10.0, format="%.2f"),
-            "weight": st.column_config.NumberColumn(step=0.1, min_value=0.0, max_value=10.0, format="%.2f"),
+            "weight":  st.column_config.NumberColumn(step=0.1, min_value=0.0, max_value=10.0, format="%.2f"),
+            "_steam_error": st.column_config.TextColumn("error", disabled=True),
         },
     )
-    if st.button("➕ Add Steam row"):
-        st.session_state.steam_rows.append({"include": True, "title": "", "appid": "", "scale_factor": 1.0, "weight": 1.0})
+    st.session_state.steam_rows = steam_df.to_dict(orient="records")
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("🔎 Validate & auto-fill (Steam)"):
+            st.session_state.steam_rows = validate_and_fill_steam_rows(st.session_state.steam_rows)
+            st.experimental_rerun()
+    with c2:
+        if st.button("➕ Add Steam row"):
+            st.session_state.steam_rows.append({"include": True, "title": "", "appid": "", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""})
+            st.experimental_rerun()
 
     st.subheader("Xbox basket")
     xbox_df = st.data_editor(
@@ -282,14 +340,27 @@ with st.sidebar:
             "title":   st.column_config.TextColumn(),
             "store_id": st.column_config.TextColumn(),
             "scale_factor": st.column_config.NumberColumn(step=0.05, min_value=0.0, max_value=10.0, format="%.2f"),
-            "weight": st.column_config.NumberColumn(step=0.1, min_value=0.0, max_value=10.0, format="%.2f"),
+            "weight":  st.column_config.NumberColumn(step=0.1, min_value=0.0, max_value=10.0, format="%.2f"),
+            "_xbox_error": st.column_config.TextColumn("error", disabled=True),
         },
     )
-    if st.button("➕ Add Xbox row"):
-        st.session_state.xbox_rows.append({"include": True, "title": "", "store_id": "", "scale_factor": 1.0, "weight": 1.0})
+    st.session_state.xbox_rows = xbox_df.to_dict(orient="records")
+    d1, d2 = st.columns(2)
+    with d1:
+        if st.button("🔎 Validate & auto-fill (Xbox)"):
+            st.session_state.xbox_rows = validate_and_fill_xbox_rows(st.session_state.xbox_rows)
+            st.experimental_rerun()
+    with d2:
+        if st.button("➕ Add Xbox row"):
+            st.session_state.xbox_rows.append({"include": True, "title": "", "store_id": "", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""})
+            st.experimental_rerun()
 
     st.divider()
     run = st.button("Run Pricing Pull", type="primary")
+
+# Run
+@dataclass
+class _Agg: pass
 
 if run:
     steam_rows = [r for r in st.session_state.steam_rows if r.get("include") and r.get("appid")]
