@@ -1,18 +1,8 @@
 # streamlit_app.py
-# ------------------------------------------------------------
-# AAA Pricing Tier Composer (Xbox + Steam)
-# Fixes in this build:
-#  - Use st.rerun() (instead of experimental) to avoid AttributeError
-#  - Validators now run without crashing and auto-fill titles
-#  - Scale/weight application is keyed by platform + ID (appid/store_id), not by title
-#  - Shows Hades II 1145350 scaling correctly; fills title for Xbox IDs like 9NSNFRQV2HQQ
-# ------------------------------------------------------------
-
-import json
+# Canonical titles + validators + scaling by identity
 import random
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Optional, Tuple
-
 import pandas as pd
 import requests
 import streamlit as st
@@ -20,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="AAA Tier Pricing Composer (Xbox + Steam)", page_icon="🎮", layout="wide")
 st.title("🎮 AAA Tier Pricing Composer — Xbox + Steam")
-st.caption("Editable basket · Per-row scale factor · Weighted means · Platform-true pulls")
+st.caption("Editable basket · Per-row scale factor · Weighted means · Platform-true pulls · Canonical titles")
 
 COUNTRY_NAMES: Dict[str, str] = {
     "US":"United States","CA":"Canada","MX":"Mexico","BR":"Brazil","AR":"Argentina","CL":"Chile","CO":"Colombia",
@@ -49,7 +39,7 @@ STEAM_CC_MAP: Dict[str, str] = {
 def steam_cc_for(market: str) -> str:
     return STEAM_CC_MAP.get(market.upper(), market.upper())
 
-XBOX_LOCALE_MAP: Dict[str, str] = {
+XBOX_LOCALE_MAP: Dict[str, Optional[str]] = {
     "US":"en-us","KZ":None,"CN":"zh-CN","UA":"uk-ua","ID":"id-id","AR":"es-ar","TR":"tr-tr","BR":"pt-br","CL":"es-cl",
     "IN":"en-in","KR":"ko-kr","PH":"en-ph","JP":"ja-jp","VN":"vi-vn","CO":"es-co","NZ":"en-nz","CR":"es-cr","SA":"ar-sa",
     "SE":None,"TW":"zh-tw","SK":"sk-sk","PE":"es-pe","PL":"pl-pl","SG":"en-sg","ZA":"en-za","HK":"zh-hk","MX":"es-mx",
@@ -60,34 +50,27 @@ XBOX_LOCALE_MAP: Dict[str, str] = {
 def xbox_locale_for(market: str) -> str:
     code = XBOX_LOCALE_MAP.get(market.upper())
     if code: return code
-    fallback = {"US":"en-us","CA":"en-ca","GB":"en-gb","AU":"en-au","NZ":"en-nz","IE":"en-ie","ZA":"en-za",
-        "MX":"es-mx","AR":"es-ar","CL":"es-cl","CO":"es-co","ES":"es-es","PE":"es-pe","CR":"es-cr",
-        "BR":"pt-br","PT":"pt-pt","FR":"fr-fr","DE":"de-de","AT":"de-at","NL":"nl-nl","IT":"it-it",
-        "JP":"ja-jp","KR":"ko-kr","TW":"zh-tw","HK":"zh-hk","CN":"zh-cn",
-        "PL":"pl-pl","CZ":"cs-cz","SK":"sk-sk","HU":"hu-hu","GR":"el-gr","FI":"fi-fi","DK":"da-dk","SE":"sv-se",
-        "TR":"tr-tr","IL":"he-il","AE":"ar-ae","QA":"ar-qa","KW":"ar-kw","SA":"ar-sa","RU":"ru-ru",
-        "IN":"en-in","SG":"en-sg","MY":"en-my","PH":"en-ph","TH":"th-th","VN":"vi-vn","ID":"id-id"}
-    return fallback.get(market.upper(), "en-us")
+    return "en-us"
 
 DEFAULT_STEAM_ROWS = [
     {"include": True, "title": "The Outer Worlds 2", "appid": "1449110", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
-    {"include": True, "title": "Madden NFL 26", "appid": "3230400", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
+    {"include": True, "title": "Madden NFL 26",       "appid": "3230400", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
     {"include": True, "title": "Call of Duty: Black Ops 6", "appid": "2933620", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
-    {"include": True, "title": "NBA 2K26", "appid": "3472040", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
-    {"include": True, "title": "Borderlands 4", "appid": "1285190", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
-    {"include": True, "title": "HELLDIVERS 2", "appid": "553850", "scale_factor": 1.75, "weight": 1.0, "_steam_error": ""},
+    {"include": True, "title": "NBA 2K26",            "appid": "3472040", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
+    {"include": True, "title": "Borderlands 4",       "appid": "1285190", "scale_factor": 1.0, "weight": 1.0, "_steam_error": ""},
+    {"include": True, "title": "HELLDIVERS 2",        "appid": "553850",  "scale_factor": 1.75, "weight": 1.0, "_steam_error": ""},
 ]
 DEFAULT_XBOX_ROWS = [
     {"include": True, "title": "The Outer Worlds 2", "store_id": "9NSPRSXXZZLG", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
-    {"include": True, "title": "Madden NFL 26", "store_id": "9NVD16NP4J8T", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
+    {"include": True, "title": "Madden NFL 26",      "store_id": "9NVD16NP4J8T", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
     {"include": True, "title": "Call of Duty: Black Ops 6", "store_id": "9PNCL2R6G8D0", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
-    {"include": True, "title": "NBA 2K26", "store_id": "9PJ2RVRC0L1X", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
-    {"include": True, "title": "Borderlands 4", "store_id": "9MX6HKF5647G", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
-    {"include": True, "title": "HELLDIVERS 2", "store_id": "9P3PT7PQJD0M", "scale_factor": 1.75, "weight": 1.0, "_xbox_error": ""},
+    {"include": True, "title": "NBA 2K26",           "store_id": "9PJ2RVRC0L1X", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
+    {"include": True, "title": "Borderlands 4",      "store_id": "9MX6HKF5647G", "scale_factor": 1.0, "weight": 1.0, "_xbox_error": ""},
+    {"include": True, "title": "HELLDIVERS 2",       "store_id": "9P3PT7PQJD0M", "scale_factor": 1.75, "weight": 1.0, "_xbox_error": ""},
 ]
 
 VANITY_RULES = {"AU":{"suffix":0.95,"nines":True},"NZ":{"suffix":0.95,"nines":True},"CA":{"suffix":0.99,"nines":True}}
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"}
+UA = {"User-Agent": "Mozilla/5.0"}
 
 @dataclass
 class PriceRow:
@@ -97,7 +80,7 @@ class PriceRow:
     currency: Optional[str]
     price: Optional[float]
     source_url: Optional[str]
-    identity: str  # "steam:<appid>" or "xbox:<store_id>"
+    identity: str
 
 @dataclass
 class MissRow:
@@ -107,8 +90,9 @@ class MissRow:
     reason: str
 
 def _nearest_x9_suffix(price: float, cents_suffix: float) -> float:
-    base_tens = int(price // 10); cand = []
-    for k in range(base_tens-2, base_tens+3):
+    base_tens = int(price // 10)
+    cand = []
+    for k in range(base_tens-2, base_tens+4):
         x = 10*k + 9 + cents_suffix
         if x > 0: cand.append(x)
     return round(min(cand, key=lambda v: (abs(v-price), -v)), 2)
@@ -144,7 +128,7 @@ def _steam_packagedetails(ids: List[int], cc: str) -> Dict[int, dict]:
         pass
     return out
 
-def fetch_steam_price(appid: str, cc_iso: str, forced_title: Optional[str] = None) -> Tuple[Optional[PriceRow], Optional[MissRow]]:
+def fetch_steam_price(appid: str, cc_iso: str, forced_title: Optional[str]) -> Tuple[Optional[PriceRow], Optional[MissRow]]:
     cc = steam_cc_for(cc_iso)
     data = _steam_appdetails(appid, cc)
     if not data:
@@ -160,7 +144,7 @@ def fetch_steam_price(appid: str, cc_iso: str, forced_title: Optional[str] = Non
         currency = (pov.get("currency") or "").upper() or None
         name = forced_title or data.get("name") or f"Steam App {appid}"
         return PriceRow("Steam", name, cc_iso.upper(), currency, price, f"https://store.steampowered.com/app/{appid}", f"steam:{appid}"), None
-    sub_ids: List[int] = []
+    sub_ids = []
     if isinstance(data.get("packages"), list):
         sub_ids += [int(x) for x in data.get("packages") if isinstance(x, int)]
     for grp in data.get("package_groups", []):
@@ -169,7 +153,7 @@ def fetch_steam_price(appid: str, cc_iso: str, forced_title: Optional[str] = Non
             if isinstance(sid, int): sub_ids.append(sid)
     sub_ids = list(dict.fromkeys(sub_ids))
     if not sub_ids:
-        return None, MissRow("Steam", forced_title or data.get("name") or appid, cc_iso, "no_price_overview_no_packages")
+        return None, MissRow("Steam", forced_title or data.get("name") or appid, cc_iso, "packagedetails_no_price")
     packs = _steam_packagedetails(sub_ids, cc=cc)
     for _, p in packs.items():
         price_obj = (p.get("price") or {})
@@ -188,16 +172,11 @@ def _ms_cv() -> str:
     import string
     return "".join(random.choice(string.ascii_letters+string.digits) for _ in range(24))
 
-def _parse_xbox_price_from_products(payload: dict) -> Tuple[Optional[float], Optional[str], Optional[str]]:
+def _parse_xbox_price_from_products(payload: dict) -> Tuple[Optional[float], Optional[str]]:
     try:
         products = payload.get("Products") or payload.get("products")
-        if not products: return None, None, None
+        if not products: return None, None
         p0 = products[0]
-        # try to read ProductTitle for auto-fill
-        title = None
-        lp = p0.get("LocalizedProperties") or p0.get("localizedProperties") or []
-        if lp and isinstance(lp, list):
-            title = lp[0].get("ProductTitle") or lp[0].get("productTitle")
         dsa = p0.get("DisplaySkuAvailabilities") or p0.get("displaySkuAvailabilities") or []
         for sku in dsa:
             avs = sku.get("Availabilities") or sku.get("availabilities") or []
@@ -207,47 +186,40 @@ def _parse_xbox_price_from_products(payload: dict) -> Tuple[Optional[float], Opt
                 amount = price.get("MSRP") or price.get("msrp") or price.get("ListPrice") or price.get("listPrice")
                 currency = price.get("CurrencyCode") or price.get("currencyCode")
                 if amount:
-                    return float(amount), (str(currency).upper() if currency else None), title
-        return None, None, title
+                    return float(amount), (str(currency).upper() if currency else None)
+        return None, None
     except Exception:
-        return None, None, None
-
-def fetch_xbox_price_one_market(product_id: str, market_iso: str, locale: str) -> Tuple[Optional[float], Optional[str], Optional[str]]:
-    headers = {"MS-CV": _ms_cv(), "Accept": "application/json"}
-    try:
-        r = requests.get(STORESDK_URL, params={"bigIds": product_id, "market": market_iso.upper(), "locale": locale}, headers=headers, timeout=25)
-        if r.status_code == 200:
-            return _parse_xbox_price_from_products(r.json())
-    except Exception:
-        pass
-    try:
-        r = requests.get(DISPLAYCATALOG_URL, params={"bigIds": product_id, "market": market_iso.upper(), "languages": locale, "fieldsTemplate": "Details"}, headers=headers, timeout=25)
-        if r.status_code == 200:
-            return _parse_xbox_price_from_products(r.json())
-    except Exception:
-        pass
-    return None, None, None
+        return None, None
 
 def fetch_xbox_price(product_name: str, product_id: str, market_iso: str) -> Tuple[Optional[PriceRow], Optional[MissRow]]:
+    headers = {"MS-CV": _ms_cv(), "Accept": "application/json"}
     loc = xbox_locale_for(market_iso)
-    amt, ccy, title = fetch_xbox_price_one_market(product_id, market_iso, loc)
-    if amt:
-        name = title or product_name or "Xbox Product"
-        return PriceRow("Xbox", name, market_iso.upper(), ccy.upper() if ccy else None, float(amt), f"https://www.xbox.com/{loc.split('-')[0]}/games/store/placeholder/{product_id}", f"xbox:{product_id}"), None
-    amt, ccy, title = fetch_xbox_price_one_market(product_id, market_iso, "en-US")
-    if amt:
-        name = title or product_name or "Xbox Product"
-        return PriceRow("Xbox", name, market_iso.upper(), ccy.upper() if ccy else None, float(amt), f"https://www.xbox.com/en-US/games/store/placeholder/{product_id}", f"xbox:{product_id}"), None
+    try:
+        r = requests.get(STORESDK_URL, params={"bigIds": product_id, "market": market_iso.upper(), "locale": loc}, headers=headers, timeout=25)
+        if r.status_code == 200:
+            amt, ccy = _parse_xbox_price_from_products(r.json())
+            if amt:
+                return PriceRow("Xbox", product_name or "Xbox Product", market_iso.upper(), ccy.upper() if ccy else None, float(amt),
+                                f"https://www.xbox.com/{loc.split('-')[0]}/games/store/placeholder/{product_id}", f"xbox:{product_id}"), None
+    except Exception:
+        pass
+    try:
+        r = requests.get(DISPLAYCATALOG_URL, params={"bigIds": product_id, "market": market_iso.upper(), "languages": "en-US", "fieldsTemplate": "Details"}, headers=headers, timeout=25)
+        if r.status_code == 200:
+            amt, ccy = _parse_xbox_price_from_products(r.json())
+            if amt:
+                return PriceRow("Xbox", product_name or "Xbox Product", market_iso.upper(), ccy.upper() if ccy else None, float(amt),
+                                f"https://www.xbox.com/en-US/games/store/placeholder/{product_id}", f"xbox:{product_id}"), None
+    except Exception:
+        pass
     return None, MissRow("Xbox", product_name or product_id, market_iso, "no_price_entries")
 
-# Validators / auto-fill
 def validate_and_fill_steam_rows(rows: List[dict]) -> List[dict]:
     updated = []
     for r in rows:
         appid = str(r.get("appid") or "").strip()
         if not appid.isdigit():
-            r["_steam_error"] = "appid must be numeric"
-            updated.append(r); continue
+            r["_steam_error"] = "appid must be numeric"; updated.append(r); continue
         data = _steam_appdetails(appid, cc="US")
         if not data:
             r["_steam_error"] = "not found on Steam API"
@@ -264,14 +236,9 @@ def validate_and_fill_xbox_rows(rows: List[dict]) -> List[dict]:
     for r in rows:
         store_id = str(r.get("store_id") or "").strip()
         if len(store_id) != 12 or not store_id.upper().startswith("9"):
-            r["_xbox_error"] = "store_id should be 12 chars (usually starts with 9)"
-            updated.append(r); continue
+            r["_xbox_error"] = "store_id should be 12 chars (usually starts with 9)"; updated.append(r); continue
         try:
-            resp = requests.get(
-                DISPLAYCATALOG_URL,
-                params={"bigIds": store_id, "market": "US", "languages": "en-US", "fieldsTemplate": "Details"},
-                headers=headers, timeout=12,
-            )
+            resp = requests.get(DISPLAYCATALOG_URL, params={"bigIds": store_id, "market": "US", "languages": "en-US", "fieldsTemplate": "Details"}, headers=headers, timeout=12)
             j = resp.json() if resp.status_code == 200 else {}
             products = j.get("Products") or j.get("products") or []
             if not products:
@@ -293,12 +260,7 @@ with st.sidebar:
     user_markets = st.text_area("Markets (comma-separated ISO country codes)", value=default_markets, height=120)
     markets = [m.strip().upper() for m in user_markets.split(",") if m.strip()]
 
-    st.markdown("""**Scale factor help**  
-- Leave **1.0** for no scaling.  
-- **39.99 → 69.99** ⇒ **1.75** (7 ÷ 4)  
-- **49.99 → 69.99** ⇒ **1.40** (7 ÷ 5)  
-- **29.99 → 69.99** ⇒ **2.33** (approx)  
-*General rule: scale_factor = target_price ÷ source_price.*""")
+    st.markdown("**Scale factor help**\n- Leave 1.0 for no scaling.\n- 39.99 -> 69.99 = 1.75 (7/4)\n- 49.99 -> 69.99 = 1.40 (7/5)\n- 29.99 -> 69.99 = 2.33\nGeneral rule: scale_factor = target_price / source_price.")
 
     if "steam_rows" not in st.session_state:
         st.session_state.steam_rows = DEFAULT_STEAM_ROWS.copy()
@@ -366,9 +328,11 @@ if run:
     steam_rows = [r for r in st.session_state.steam_rows if r.get("include") and r.get("appid")]
     xbox_rows  = [r for r in st.session_state.xbox_rows  if r.get("include") and r.get("store_id")]
 
-    # meta keyed by identity
-    steam_meta = { f"steam:{str(r['appid']).strip()}": {"weight": float(r.get("weight",1.0)), "scale": float(r.get("scale_factor",1.0))} for r in steam_rows }
-    xbox_meta  = { f"xbox:{str(r['store_id']).strip()}": {"weight": float(r.get("weight",1.0)), "scale": float(r.get("scale_factor",1.0))} for r in xbox_rows }
+    steam_meta   = { f"steam:{str(r['appid']).strip()}": {"weight": float(r.get("weight",1.0)), "scale": float(r.get("scale_factor",1.0))} for r in steam_rows }
+    xbox_meta    = { f"xbox:{str(r['store_id']).strip()}": {"weight": float(r.get("weight",1.0)), "scale": float(r.get("scale_factor",1.0))} for r in xbox_rows }
+    steam_title  = { f"steam:{str(r['appid']).strip()}": (r.get("title") or f"Steam App {r['appid']}") for r in steam_rows }
+    xbox_title   = { f"xbox:{str(r['store_id']).strip()}": (r.get("title") or f"Xbox Product {r['store_id']}") for r in xbox_rows }
+    TITLE_MAP = {**steam_title, **xbox_title}
 
     rows: List[PriceRow] = []
     misses: List[MissRow] = []
@@ -377,10 +341,10 @@ if run:
         with ThreadPoolExecutor(max_workers=20) as ex:
             for cc in markets:
                 for r in steam_rows:
-                    futures.append(ex.submit(fetch_steam_price, str(r["appid"]).strip(), cc, r.get("title") or None))
+                    futures.append(ex.submit(fetch_steam_price, str(r["appid"]).strip(), cc, TITLE_MAP[f"steam:{str(r['appid']).strip()}"]))
             for cc in markets:
                 for r in xbox_rows:
-                    futures.append(ex.submit(fetch_xbox_price, r.get("title") or "", str(r["store_id"]).strip(), cc))
+                    futures.append(ex.submit(fetch_xbox_price, TITLE_MAP[f"xbox:{str(r['store_id']).strip()}"], str(r["store_id"]).strip(), cc))
 
             for f in as_completed(futures):
                 try:
@@ -399,13 +363,11 @@ if run:
     raw_df = pd.DataFrame([asdict(r) for r in rows])
     if not raw_df.empty:
         raw_df.insert(2, "country_name", raw_df["country"].map(country_name))
-
-        # attach scale/weight by identity
         def _meta(identity):
             return (steam_meta if identity.startswith("steam:") else xbox_meta).get(identity, {"weight":1.0, "scale":1.0})
-        meta = raw_df["identity"].map(lambda i: _meta(i))
-        meta_df = pd.DataFrame(list(meta))
+        meta_df = pd.DataFrame(list(raw_df["identity"].map(lambda i: _meta(i))))
         raw_df = pd.concat([raw_df, meta_df], axis=1)
+        raw_df["title"] = raw_df["identity"].map(lambda i: TITLE_MAP.get(i, "Unknown"))
         raw_df["price"] = raw_df["price"] * raw_df["scale"]
         raw_df["title"] = raw_df.apply(lambda r: f"{r['title']} (scaled)" if r["scale"] and abs(r["scale"]-1.0) > 1e-6 else r["title"], axis=1)
 
@@ -453,4 +415,4 @@ if run:
         st.dataframe(miss_df)
 
 else:
-    st.info("Edit the baskets in the sidebar, set markets, then click **Run Pricing Pull**.", icon="🛠️")
+    st.info("Edit the baskets in the sidebar, set markets, then click Run Pricing Pull.", icon="🛠️")
