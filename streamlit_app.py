@@ -1,7 +1,8 @@
 # streamlit_app.py
 # ------------------------------------------------------------
 # AAA Pricing Tier Composer (Xbox + Steam)
-# Adds: Canonical English titles + USD conversion + USD variance
+# Adds: Canonical English titles · USD conversion · Variance vs US
+# New: FX Benchmark View tables per platform (Local, USD, %Diff vs US)
 # ------------------------------------------------------------
 
 import random, time, re
@@ -15,7 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 st.set_page_config(page_title="AAA Tier Pricing Composer (Xbox + Steam)", page_icon="🎮", layout="wide")
 st.title("🎮 AAA Tier Pricing Composer — Xbox + Steam")
-st.caption("Editable basket · Per-row scale factor · Weighted means · Platform-true pulls · Canonical titles · USD conversion + variance")
+st.caption("Editable basket · Per-row scale factor · Weighted means · Platform-true pulls · Canonical titles · USD conversion + variance views")
 
 # -----------------------------
 # Country names
@@ -123,26 +124,8 @@ def apply_vanity(country: str, price: float) -> float:
 # -----------------------------
 # USD conversion
 # -----------------------------
-def parse_overrides(text: str) -> Dict[str, float]:
-    """
-    Parse overrides like: 'ARS=950, BRL=5.2, JPY=160' meaning 1 USD = X CUR.
-    """
-    out: Dict[str, float] = {}
-    if not text:
-        return out
-    for part in re.split(r"[,\n]+", text.strip()):
-        if not part.strip(): 
-            continue
-        if "=" in part:
-            k,v = part.split("=",1)
-            try:
-                out[k.strip().upper()] = float(v.strip())
-            except Exception:
-                pass
-    return out
-
-def fetch_usd_rates(force: bool = False, overrides: Optional[Dict[str,float]] = None) -> Dict[str, float]:
-    """Fetch currency rates with USD as base. Cache ~2h. Apply overrides last."""
+def fetch_usd_rates(force: bool = False) -> Dict[str, float]:
+    """Fetch currency rates with USD as base. Cache ~2h. Two-provider fallback."""
     now = time.time()
     cache_ok = (
         "usd_rates" in st.session_state and
@@ -151,37 +134,35 @@ def fetch_usd_rates(force: bool = False, overrides: Optional[Dict[str,float]] = 
         not force
     )
     if cache_ok:
-        rates = dict(st.session_state["usd_rates"])
-    else:
-        rates = {"USD": 1.0}
-        # try #1
+        return dict(st.session_state["usd_rates"])
+
+    rates = {"USD": 1.0}
+    # primary
+    try:
+        resp = requests.get("https://api.exchangerate.host/latest", params={"base": "USD"}, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json() or {}
+            if "rates" in data and isinstance(data["rates"], dict):
+                for k, v in data["rates"].items():
+                    if isinstance(v, (int, float)) and v > 0:
+                        rates[k.upper()] = float(v)
+    except Exception:
+        pass
+    # fallback
+    if len(rates) <= 1:
         try:
-            resp = requests.get("https://api.exchangerate.host/latest", params={"base": "USD"}, timeout=15)
-            if resp.status_code == 200:
-                data = resp.json() or {}
-                if "rates" in data and isinstance(data["rates"], dict):
-                    for k, v in data["rates"].items():
-                        if isinstance(v, (int, float)) and v > 0:
+            r2 = requests.get("https://open.er-api.com/v6/latest/USD", timeout=15)
+            if r2.status_code == 200:
+                d2 = r2.json() or {}
+                if d2.get("result") == "success" and isinstance(d2.get("rates"), dict):
+                    for k,v in d2["rates"].items():
+                        if isinstance(v, (int,float)) and v>0:
                             rates[k.upper()] = float(v)
         except Exception:
             pass
-        # try #2 fallback
-        if len(rates) <= 1:
-            try:
-                r2 = requests.get("https://open.er-api.com/v6/latest/USD", timeout=15)
-                if r2.status_code == 200:
-                    d2 = r2.json() or {}
-                    if d2.get("result") == "success" and isinstance(d2.get("rates"), dict):
-                        for k,v in d2["rates"].items():
-                            if isinstance(v, (int,float)) and v>0:
-                                rates[k.upper()] = float(v)
-            except Exception:
-                pass
-        st.session_state["usd_rates"] = dict(rates)
-        st.session_state["usd_rates_ts"] = now
-    # apply overrides
-    if overrides:
-        rates.update({k.upper(): float(v) for k,v in overrides.items() if isinstance(v,(int,float)) and v>0})
+
+    st.session_state["usd_rates"] = dict(rates)
+    st.session_state["usd_rates_ts"] = now
     return rates
 
 def to_usd(amount: Optional[float], currency: Optional[str], rates: Dict[str, float]) -> Optional[float]:
@@ -371,12 +352,6 @@ with st.sidebar:
 - **29.99 → 69.99** ⇒ **2.33**  
 *General rule: scale_factor = target_price ÷ source_price.*""")
 
-    st.subheader("USD Benchmark & FX")
-    bench_mode = st.radio("Variance benchmark", ["Fixed $ amount", "Use US recommendation"], index=0, help="What USD value should variance be compared to?")
-    bench_fixed = st.number_input("Fixed benchmark (USD)", min_value=0.0, value=69.99, step=0.5)
-    fx_override_txt = st.text_area("FX overrides (optional: CUR=rate, comma/line separated). Example: ARS=950, BRL=5.2, JPY=160", value="", height=70)
-    refetch_fx = st.checkbox("Force refresh FX on next run", value=False)
-
     if "steam_rows" not in st.session_state:
         st.session_state.steam_rows = DEFAULT_STEAM_ROWS.copy()
     if "xbox_rows" not in st.session_state:
@@ -490,16 +465,8 @@ if run:
         raw_df["title"] = raw_df.apply(lambda r: f"{r['title']} (scaled)" if r["scale"] and abs(r["scale"]-1.0) > 1e-6 else r["title"], axis=1)
 
         # ---- USD conversion on RAW rows
-        overrides = parse_overrides(fx_override_txt)
-        rates = fetch_usd_rates(force=refetch_fx, overrides=overrides)
+        rates = fetch_usd_rates(force=False)
         raw_df["price_usd"] = [to_usd(p, c, rates) for p,c in zip(raw_df["price"], raw_df["currency"])]
-
-        # Benchmarks (per platform)
-        bench_x = bench_fixed
-        bench_s = bench_fixed
-        if bench_mode == "Use US recommendation":
-            # we'll fill after reco tables are built (below)
-            pass
 
         st.subheader("Raw Basket Rows (after scaling)")
         st.dataframe(raw_df)
@@ -525,48 +492,39 @@ if run:
         reco_xbox["RecommendedPriceUSD"]  = [to_usd(p, cur, rates) for p,cur in zip(reco_xbox["RecommendedPrice"],  reco_xbox["currency"])]
         reco_steam["RecommendedPriceUSD"] = [to_usd(p, cur, rates) for p,cur in zip(reco_steam["RecommendedPrice"], reco_steam["currency"])]
 
-        # Fill benchmarks if mode = US recommendation
-        if bench_mode == "Use US recommendation":
-            bx = reco_xbox.loc[reco_xbox["country"]=="US"]
-            bs = reco_steam.loc[reco_steam["country"]=="US"]
-            if not bx.empty:
-                bench_x = to_usd(float(bx["RecommendedPrice"].iloc[0]), str(bx["currency"].iloc[0]), rates) or bench_fixed
-            else:
-                bench_x = bench_fixed
-            if not bs.empty:
-                bench_s = to_usd(float(bs["RecommendedPrice"].iloc[0]), str(bs["currency"].iloc[0]), rates) or bench_fixed
-            else:
-                bench_s = bench_fixed
+        # ---------------- FX Benchmark View (like your screenshot) ----------------
+        def fx_view(df: pd.DataFrame, label: str) -> pd.DataFrame:
+            # derive US benchmark automatically
+            us_row = df.loc[df["country"]=="US"]
+            if us_row.empty:
+                return pd.DataFrame()  # no US row to benchmark
+            us_local = float(us_row["RecommendedPrice"].iloc[0])
+            us_ccy   = str(us_row["currency"].iloc[0])
+            us_usd   = to_usd(us_local, us_ccy, rates) or None
 
-        # Variance columns (USD)
-        reco_xbox["RecommendedPriceUSD_Variance"]  = [None if pd.isna(v) else round(v - bench_x, 2) for v in reco_xbox["RecommendedPriceUSD"]]
-        reco_steam["RecommendedPriceUSD_Variance"] = [None if pd.isna(v) else round(v - bench_s, 2) for v in reco_steam["RecommendedPriceUSD"]]
+            out = df[["country_name","country","currency","RecommendedPrice"]].copy()
+            out.rename(columns={"RecommendedPrice":"LocalPrice"}, inplace=True)
+            out["USDPrice"] = [to_usd(p, cur, rates) for p,cur in zip(out["LocalPrice"], out["currency"])]
+            if us_usd is not None:
+                out["DiffUSD"] = [None if pd.isna(v) else round(v - us_usd, 2) for v in out["USDPrice"]]
+                out["PctDiff"] = [None if pd.isna(v) or us_usd==0 else round((v/us_usd - 1.0)*100.0, 0) for v in out["USDPrice"]]
+            out.insert(0, "platform", label)
+            return out.sort_values("country_name").reset_index(drop=True)
 
-        st.caption(f"FX currencies loaded: {len(rates)} (USD=1). Benchmark Xbox USD={bench_x:.2f}, Steam USD={bench_s:.2f}")
+        fx_x = fx_view(reco_xbox, "Xbox") if not reco_xbox.empty else pd.DataFrame()
+        fx_s = fx_view(reco_steam, "Steam") if not reco_steam.empty else pd.DataFrame()
 
-        st.subheader("Price Recommendations — Xbox (weighted per country)")
-        st.dataframe(reco_xbox)
-
-        st.subheader("Price Recommendations — Steam (weighted per country)")
-        st.dataframe(reco_steam)
-
-        # Add variance to RAW rows (per platform benchmark)
-        raw_df["price_usd_variance"] = raw_df.apply(lambda r: None if pd.isna(r["price_usd"]) else round(r["price_usd"] - (bench_x if r["platform"]=="Xbox" else bench_s), 2), axis=1)
-        # update raw view with variance
-        st.subheader("Raw Basket Rows (USD conversion + variance)")
-        st.dataframe(raw_df)
+        if not fx_x.empty:
+            st.subheader("FX Benchmark View — Xbox (Local, USD, %Diff vs US)")
+            st.dataframe(fx_x)
+        if not fx_s.empty:
+            st.subheader("FX Benchmark View — Steam (Local, USD, %Diff vs US)")
+            st.dataframe(fx_s)
+        # --------------------------------------------------------------------------
 
         merged = pd.merge(
-            reco_xbox.rename(columns={
-                "RecommendedPrice":"XboxRecommended",
-                "RecommendedPriceUSD":"XboxRecommendedUSD",
-                "RecommendedPriceUSD_Variance":"XboxRecommendedUSD_Variance"
-            }),
-            reco_steam.rename(columns={
-                "RecommendedPrice":"SteamRecommended",
-                "RecommendedPriceUSD":"SteamRecommendedUSD",
-                "RecommendedPriceUSD_Variance":"SteamRecommendedUSD_Variance"
-            }),
+            reco_xbox.rename(columns={"RecommendedPrice":"XboxRecommended","RecommendedPriceUSD":"XboxRecommendedUSD"}),
+            reco_steam.rename(columns={"RecommendedPrice":"SteamRecommended","RecommendedPriceUSD":"SteamRecommendedUSD"}),
             on=["country_name","country","currency"],
             how="outer",
         ).sort_values(["country"]).reset_index(drop=True)
