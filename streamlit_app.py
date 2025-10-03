@@ -1,8 +1,9 @@
 # streamlit_app.py
 # ------------------------------------------------------------
-# AAA Pricing Tier Composer (Xbox + Steam)
-# Adds: Canonical English titles · USD conversion · Variance vs US
-# New: FX Benchmark View tables per platform (Local, USD, %Diff vs US)
+# Game Pricing Recommendation Tool (Xbox + Steam)
+# Features: Editable baskets, per-row scale factor, weighted means,
+# platform-true pulls, canonical English titles, USD conversion,
+# variance vs US, "Regional Pricing Recommendation" views.
 # ------------------------------------------------------------
 
 import random, time, re
@@ -14,8 +15,11 @@ import requests
 import streamlit as st
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title="AAA Tier Pricing Composer (Xbox + Steam)", page_icon="🎮", layout="wide")
-st.title("🎮 AAA Tier Pricing Composer — Xbox + Steam")
+# -----------------------------
+# App header
+# -----------------------------
+st.set_page_config(page_title="Game Pricing Recommendation Tool", page_icon="🎮", layout="wide")
+st.title("🎮 Game Pricing Recommendation Tool")
 st.caption("Editable basket · Per-row scale factor · Weighted means · Platform-true pulls · Canonical titles · USD conversion + variance views")
 
 # -----------------------------
@@ -492,7 +496,7 @@ if run:
         reco_xbox["RecommendedPriceUSD"]  = [to_usd(p, cur, rates) for p,cur in zip(reco_xbox["RecommendedPrice"],  reco_xbox["currency"])]
         reco_steam["RecommendedPriceUSD"] = [to_usd(p, cur, rates) for p,cur in zip(reco_steam["RecommendedPrice"], reco_steam["currency"])]
 
-        # ---------------- FX Benchmark View (like your screenshot) ----------------
+        # ---------------- Regional Pricing Recommendation views ----------------
         def fx_view(df: pd.DataFrame, label: str) -> pd.DataFrame:
             # derive US benchmark automatically
             us_row = df.loc[df["country"]=="US"]
@@ -507,7 +511,7 @@ if run:
             out["USDPrice"] = [to_usd(p, cur, rates) for p,cur in zip(out["LocalPrice"], out["currency"])]
             if us_usd is not None:
                 out["DiffUSD"] = [None if pd.isna(v) else round(v - us_usd, 2) for v in out["USDPrice"]]
-                out["PctDiff"] = [None if pd.isna(v) or us_usd==0 else round((v/us_usd - 1.0)*100.0, 0) for v in out["USDPrice"]]
+                out["PctDiff"] = [None if pd.isna(v) or us_usd==0 else str(round((v/us_usd - 1.0)*100.0, 0)) + "%" for v in out["USDPrice"]]
             out.insert(0, "platform", label)
             return out.sort_values("country_name").reset_index(drop=True)
 
@@ -515,12 +519,12 @@ if run:
         fx_s = fx_view(reco_steam, "Steam") if not reco_steam.empty else pd.DataFrame()
 
         if not fx_x.empty:
-            st.subheader("FX Benchmark View — Xbox (Local, USD, %Diff vs US)")
+            st.subheader("Xbox Regional Pricing Recommendation (Local, USD, %Diff vs US)")
             st.dataframe(fx_x)
         if not fx_s.empty:
-            st.subheader("FX Benchmark View — Steam (Local, USD, %Diff vs US)")
+            st.subheader("Steam Regional Pricing Recommendation (Local, USD, %Diff vs US)")
             st.dataframe(fx_s)
-        # --------------------------------------------------------------------------
+        # ----------------------------------------------------------------------
 
         merged = pd.merge(
             reco_xbox.rename(columns={"RecommendedPrice":"XboxRecommended","RecommendedPriceUSD":"XboxRecommendedUSD"}),
