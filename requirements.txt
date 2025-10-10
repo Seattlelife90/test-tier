@@ -1,5 +1,7 @@
-streamlit
-requests
-beautifulsoup4
-pandas
 
+streamlit>=1.39
+requests>=2.31
+beautifulsoup4>=4.12
+pytz
+pandas>=2.2
+numpy>=1.26
