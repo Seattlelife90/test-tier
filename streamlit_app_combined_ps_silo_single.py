@@ -1,172 +1,137 @@
 
-# streamlit_app_combined_ps_silo_single.py
-# v1.0 — Steam & Xbox kept separate; PlayStation in its own silo
-# Dependencies: streamlit, requests, pandas, beautifulsoup4
-# (requirements.txt should include: streamlit==1.38.0, requests, pandas, beautifulsoup4)
-
-from __future__ import annotations
-import re, json, time, math
+import re
+import time
+import json
+import logging
 from typing import Dict, List, Optional, Tuple
+
 import requests
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 
+st.set_page_config(page_title="Game Pricing – vSilos (Xbox • Steam • PlayStation)", layout="wide")
+
+log = logging.getLogger("app")
+logging.basicConfig(level=logging.INFO)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"})
 
-# -----------------------------
-# Steam (kept as you had it)
-# -----------------------------
-STEAM_MARKETS = ["AE","AR","AT","AU","BE","BG","BH","BR","CA","CH","CL","CN","CO","CR","CY","CZ","DE","DK","DO",
-                 "EC","EE","EG","ES","FI","FR","GB","GR","GT","HK","HN","HU","ID","IE","IL","IN","IS","IT","JP",
-                 "KR","KW","LB","LU","LV","MA","MT","MX","MY","NI","NL","NO","NZ","OM","PA","PE","PH","PL","PR",
-                 "PT","PY","QA","RO","RS","RU","SA","SE","SG","SI","SK","SV","TH","TR","TW","UA","US","UY","ZA"]
+def _get(url: str, timeout: float = 20.0) -> str:
+    r = requests.get(url, headers={"User-Agent": UA}, timeout=timeout)
+    r.raise_for_status()
+    return r.text
 
-def steam_price_from_page(appid: str, country: str) -> Optional[Tuple[str, float, str]]:
-    url = f"https://store.steampowered.com/app/{appid}"
+def _num_from_text(text: str) -> Optional[float]:
+    if not text:
+        return None
+    m = re.search(r'(\d{1,3}(?:[\.,]\d{3})*(?:[\.,]\d{2}))', text)
+    if not m:
+        return None
+    val = m.group(1).replace(',', '').replace(' ', '')
+    val = val.replace('٬', '').replace('．','.')  # odd separators
+    if val.count('.') > 1:
+        # fallback: last dot is decimal
+        head, _, tail = val.rpartition('.')
+        val = head.replace('.','') + '.' + tail
     try:
-        r = SESSION.get(url, timeout=25)
-        if r.status_code != 200:
-            return None
-        html = r.text
-        m = re.search(r'"final_price":\s*?(\d+)', html)
-        cur = "USD"
-        if m:
-            cents = int(m.group(1))
-            return (url, round(cents/100.0, 2), cur)
-        m2 = re.search(r'(\$|USD)\s?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)', html)
-        if m2:
-            amt = m2.group(2).replace(",", "")
-            return (url, float(amt), "USD")
+        return float(val)
     except Exception:
         return None
-    return None
 
-# -----------------------------
-# Xbox (kept as you had it)
-# -----------------------------
-XBOX_MARKETS = STEAM_MARKETS
+# Very small silo map for currencies by locale (extend as needed)
+PS_LOCALE_TO_CCY = {
+    "en-us": "USD", "en-ca": "CAD", "en-gb": "GBP", "en-au": "AUD",
+    "en-nz": "NZD", "en-hk": "HKD", "zh-hk": "HKD", "de-de": "EUR",
+    "fr-fr": "EUR", "es-es": "EUR", "it-it": "EUR", "pt-br": "BRL",
+    "ja-jp": "JPY", "ko-kr": "KRW",
+}
 
-def xbox_price_from_page(store_id: str, country: str) -> Optional[Tuple[str, float, str]]:
-    url = f"https://www.xbox.com/{country.lower()}/games/store/_/{store_id}"
+def _locale_from_url(url: str) -> Optional[str]:
+    # https://store.playstation.com/en-us/product/UP1001-PPSA01494_00-0000000000000AK2
+    m = re.search(r'store\.playstation\.com/([a-z]{2}-[a-z]{2})/', url, re.I)
+    return m.group(1).lower() if m else None
+
+def parse_ps_mspp(html: str) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Return (msrp, sale) from a PS Store HTML.
+    Strategy:
+      1) If there's a <del> (struck-through), treat it as MSRP and the nearby number as sale.
+      2) Else, if two prices appear in the primary buy block, treat the larger as MSRP.
+      3) Else, if only one number, treat it as MSRP.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1) explicit strike-through tags
+    strike = None
+    for tagname in ("del", "s"):
+        t = soup.find(tagname)
+        if t and _num_from_text(t.get_text(strip=True)) is not None:
+            strike = _num_from_text(t.get_text(" ", strip=True))
+            break
+
+    # 2) collect visible prices in the buy section
+    text_blob = " ".join(x.get_text(" ", strip=True) for x in soup.find_all(["div","span","p"]))
+    # Fixed regex (the previous build had a mismatched bracket). This finds numbers like 69.99 or 1,299.00, etc.
+    nums = [ _num_from_text(m.group(0)) for m in re.finditer(r'(\d{1,3}(?:[\.,]\d{3})*(?:[\.,]\d{2}))', text_blob) ]
+    nums = [n for n in nums if n is not None]
+
+    msrp = None
+    sale = None
+
+    if strike is not None:
+        msrp = strike
+        # try to find a number smaller than MSRP near by (heuristic)
+        smaller = [n for n in nums if n < msrp * 0.999]
+        sale = min(smaller) if smaller else None
+    elif len(nums) >= 2:
+        msrp = max(nums)
+        sale = min(nums)
+    elif len(nums) == 1:
+        msrp = nums[0]
+
+    return msrp, sale
+
+def fetch_ps_one(url: str) -> Dict[str, Optional[str]]:
     try:
-        r = SESSION.get(url, timeout=25)
-        if r.status_code != 200:
-            return None
-        html = r.text
-        m_sr = re.search(r'aria-label="(?:Original price|Full price) .*?(\$|\€|\£)?\s?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)', html)
-        m_now = re.search(r'itemprop="price".*?content="(\d+(?:\.\d{2})?)"', html)
-        cur = "USD"
-        if m_sr:
-            amt = m_sr.group(2).replace(",", "")
-            return (url, float(amt), cur)
-        if m_now:
-            return (url, float(m_now.group(1)), cur)
-    except Exception:
-        return None
-    return None
+        html = _get(url, timeout=25)
+    except Exception as e:
+        return {"platform":"PlayStation", "currency":None, "price":None, "msrp":None, "sale":None, "source_url":url, "reason":f"fetch_error: {e}"}
 
-# -----------------------------
-# PlayStation SILO
-# -----------------------------
-PS_MARKETS = [
-    ("US", "en-us", "USD"),
-    ("CA", "en-ca", "CAD"),
-    ("AR", "es-ar", "USD"),
-    ("CL", "es-cl", "USD"),
-    ("BR", "pt-br", "BRL"),
-    ("GB", "en-gb", "GBP"),
-    ("DE", "de-de", "EUR"),
-    ("FR", "fr-fr", "EUR"),
-    ("AU", "en-au", "AUD"),
-    ("NZ", "en-nz", "NZD"),
-    ("HK", "en-hk", "HKD"),
-    ("JP", "ja-jp", "JPY"),
-]
+    msrp, sale = parse_ps_mspp(html)
 
-def _norm_ps_url(ps_ref: str, locale: str) -> str:
-    if ps_ref.startswith("http"):
-        return re.sub(r"store.playstation.com/([a-z]{2}-[a-z]{2})/", f"store.playstation.com/{locale}/", ps_ref)
-    return f"https://store.playstation.com/{locale}/product/{ps_ref}"
+    loc = _locale_from_url(url)
+    ccy = PS_LOCALE_TO_CCY.get(loc or "", None)
 
-def ps_fetch_one(ps_ref: str, country: str, locale: str) -> Optional[Tuple[str, float, str, str]]:
-    url = _norm_ps_url(ps_ref, locale)
-    try:
-        r = SESSION.get(url, timeout=30)
-        if r.status_code != 200:
-            return None
-        html = r.text
-        m_strike = re.search(r'(?:was|original|strikethrough)["']?:?\s?\$?(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))', html, re.I)
-        if m_strike:
-            amt = m_strike.group(1).replace(",", "")
-            return (url, float(amt), "USD", "MSRP")
-        m = re.findall(r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2}))', html)
-        vals = [float(x.replace(",", "")) for x in m if x]
-        if vals:
-            return (url, max(vals), "USD", "Largest")
-    except Exception:
-        return None
-    return None
+    return {"platform":"PlayStation", "currency": ccy, "price": msrp or sale, "msrp": msrp, "sale": sale, "source_url": url, "reason": None if (msrp or sale) else "no_price"}
 
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="Game Pricing – vSilos (Xbox • Steam • PlayStation)", layout="wide")
+
 st.title("🎮 Game Pricing – vSilos (Xbox • Steam • PlayStation)")
 
-st.caption("Steam & Xbox keep their working logic. PlayStation uses its own silo.")
+st.caption("This build hotfixes the PlayStation MSRP regex syntax error and keeps MSRP > sale when both appear.")
 
-colL, colR = st.columns([1,3])
-with colL:
-    st.subheader("Controls")
-    quick = st.toggle("⚡ Quick run (first 10 markets)", value=True)
-    prefer_msrp = st.toggle("Prefer MSRP", value=True)
+with st.expander("PlayStation basket (PS silo)", expanded=True):
+    st.write("Enter up to 6 PS product URLs (one per line):")
+    default_urls = "\n".join([
+        "https://store.playstation.com/en-us/product/UP1001-PPSA01494_00-0000000000000AK2",  # Borderlands 4 (example)
+    ])
+    ps_urls = st.text_area("PS URLs", value=default_urls, height=120)
+    run = st.button("Run Pricing Pull")
 
-steam_basket = [
-    {"include": True,  "title":"The Outer Worlds 2", "appid":"1449110", "scale":1.0, "weight":1},
-    {"include": True,  "title":"Madden NFL 26",      "appid":"3230400", "scale":1.0, "weight":1},
-]
-
-xbox_basket = [
-    {"include": True, "title":"The Outer Worlds 2", "store_id":"9NSPRSXXZZLG", "scale":1.0,"weight":1},
-]
-
-ps_basket = [
-    {"include": True, "title":"The Outer Worlds 2", "ps_ref":"UP1001-PPSA01494_00-0000000000000AK2"},
-]
-
-st.info("Pulling prices across markets…")
-
-rows = []
-
-for g in steam_basket:
-    if not g["include"]: continue
-    for c in STEAM_MARKETS[:10 if quick else len(STEAM_MARKETS)]:
-        got = steam_price_from_page(g["appid"], c)
-        if got:
-            url, price, cur = got
-            rows.append({"platform":"Steam","title":g["title"],"country":c,"currency":cur,"price":price,"source_url":url})
-        time.sleep(0.1)
-
-for g in xbox_basket:
-    if not g["include"]: continue
-    for c in XBOX_MARKETS[:10 if quick else len(XBOX_MARKETS)]:
-        got = xbox_price_from_page(g["store_id"], c)
-        if got:
-            url, price, cur = got
-            rows.append({"platform":"Xbox","title":g["title"],"country":c,"currency":cur,"price":price,"source_url":url})
-        time.sleep(0.1)
-
-for g in ps_basket:
-    if not g["include"]: continue
-    for (cc, locale, cur) in PS_MARKETS[:10 if quick else len(PS_MARKETS)]:
-        got = ps_fetch_one(g["ps_ref"], cc, locale)
-        if got:
-            url, price, cur2, note = got
-            rows.append({"platform":"PlayStation","title":g["title"],"country":cc,"currency":cur2,"price":price,"source_url":url,"note":note})
-        time.sleep(0.2)
-
-df = pd.DataFrame(rows)
-st.dataframe(df, use_container_width=True)
+if run:
+    urls = [u.strip() for u in ps_urls.splitlines() if u.strip()]
+    rows = [fetch_ps_one(u) for u in urls]
+    df = pd.DataFrame(rows)
+    st.subheader("Raw results")
+    st.dataframe(df, use_container_width=True)
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button("Download CSV", data=csv, file_name="ps_results.csv", mime="text/csv")
+else:
+    st.info("Add URLs and click **Run Pricing Pull**.")
