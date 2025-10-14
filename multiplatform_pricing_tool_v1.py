@@ -199,6 +199,19 @@ def extract_steam_appid(input_str: str) -> Optional[str]:
         return match.group(1)
     return None
 
+def fetch_steam_title(appid: str) -> str:
+    """Fetch Steam game title"""
+    try:
+        url = "https://store.steampowered.com/api/appdetails"
+        params = {"appids": appid, "cc": "US", "l": "en"}
+        resp = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=15)
+        data = resp.json().get(str(appid), {})
+        if data.get("success") and data.get("data"):
+            return data["data"].get("name", f"Steam Game {appid}")
+    except Exception:
+        pass
+    return f"Steam Game {appid}"
+
 def fetch_steam_price(appid: str, country: str, title: str) -> Optional[PriceData]:
     """Fetch Steam price for a specific country"""
     if country not in STEAM_MARKETS:
@@ -210,7 +223,7 @@ def fetch_steam_price(appid: str, country: str, title: str) -> Optional[PriceDat
     try:
         url = "https://store.steampowered.com/api/appdetails"
         params = {"appids": appid, "cc": cc, "l": "en"}
-        resp = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=25)
+        resp = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=30)
         data = resp.json().get(str(appid), {})
         
         if not data.get("success"):
@@ -224,7 +237,7 @@ def fetch_steam_price(appid: str, country: str, title: str) -> Optional[PriceDat
             price = round(price_cents / 100.0, 2)
             return PriceData("Steam", title, country, currency, price, None, None)
         
-    except Exception:
+    except Exception as e:
         pass
     
     return PriceData("Steam", title, country, currency, None, None, None)
@@ -243,6 +256,27 @@ def extract_xbox_store_id(input_str: str) -> Optional[str]:
         return match.group(1).upper()
     return None
 
+def fetch_xbox_title(store_id: str) -> str:
+    """Fetch Xbox game title"""
+    headers = {
+        "MS-CV": ''.join(random.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', k=24)),
+        "Accept": "application/json"
+    }
+    try:
+        url = "https://displaycatalog.mp.microsoft.com/v7.0/products"
+        params = {"bigIds": store_id, "market": "US", "languages": "en-US"}
+        resp = requests.get(url, params=params, headers=headers, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            products = data.get("Products", [])
+            if products:
+                local_props = products[0].get("LocalizedProperties", [])
+                if local_props and local_props[0].get("ProductTitle"):
+                    return local_props[0]["ProductTitle"]
+    except Exception:
+        pass
+    return f"Xbox Game {store_id}"
+
 def fetch_xbox_price(store_id: str, country: str, title: str) -> Optional[PriceData]:
     """Fetch Xbox price for a specific country"""
     if country not in XBOX_MARKETS:
@@ -257,9 +291,9 @@ def fetch_xbox_price(store_id: str, country: str, title: str) -> Optional[PriceD
     }
     
     try:
-        url = "https://storeedgefd.dsx.mp.microsoft.com/v9.0/sdk/products"
-        params = {"bigIds": store_id, "market": country, "locale": locale}
-        resp = requests.get(url, params=params, headers=headers, timeout=25)
+        url = "https://displaycatalog.mp.microsoft.com/v7.0/products"
+        params = {"bigIds": store_id, "market": country, "languages": "en-US"}
+        resp = requests.get(url, params=params, headers=headers, timeout=30)
         
         if resp.status_code == 200:
             data = resp.json()
@@ -272,7 +306,7 @@ def fetch_xbox_price(store_id: str, country: str, title: str) -> Optional[PriceD
                         amount = price_data.get("MSRP") or price_data.get("ListPrice")
                         if amount:
                             return PriceData("Xbox", title, country, currency, float(amount), None, None)
-    except Exception:
+    except Exception as e:
         pass
     
     return PriceData("Xbox", title, country, currency, None, None, None)
@@ -317,6 +351,19 @@ def parse_ps_next_json(html: str) -> Tuple[Optional[str], Optional[float], Optio
     except Exception:
         return None, None, None
 
+def fetch_ps_title(product_id: str) -> str:
+    """Fetch PlayStation game title"""
+    try:
+        url = f"https://store.playstation.com/en-us/product/{product_id}"
+        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=15)
+        if resp.status_code == 200:
+            title, _, _ = parse_ps_next_json(resp.text)
+            if title:
+                return title
+    except Exception:
+        pass
+    return f"PS Game {product_id}"
+
 def fetch_ps_price(product_id: str, country: str, title: str) -> Optional[PriceData]:
     """Fetch PlayStation price for a specific country"""
     if country not in PS_MARKETS:
@@ -327,14 +374,14 @@ def fetch_ps_price(product_id: str, country: str, title: str) -> Optional[PriceD
     
     try:
         url = f"https://store.playstation.com/{locale}/product/{product_id}"
-        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=25)
+        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=30)
         
         if resp.status_code == 200:
             _, price, parsed_currency = parse_ps_next_json(resp.text)
             if price:
                 final_currency = parsed_currency.upper() if parsed_currency else currency
                 return PriceData("PlayStation", title, country, final_currency, price, None, None)
-    except Exception:
+    except Exception as e:
         pass
     
     return PriceData("PlayStation", title, country, currency, None, None, None)
@@ -416,9 +463,9 @@ def process_results(results: List[PriceData], rates: Dict[str, float]) -> pd.Dat
         "Title": r.title,
         "Country": COUNTRY_NAMES.get(r.country, r.country),
         "Currency": r.currency,
-        "Local Price": r.price if r.price else "N/A",
-        "USD Price": r.price_usd if r.price_usd else "N/A",
-        "% Diff vs US": r.diff_vs_us if r.diff_vs_us else "N/A"
+        "Local Price": r.price if r.price is not None else None,
+        "USD Price": r.price_usd if r.price_usd is not None else None,
+        "% Diff vs US": r.diff_vs_us if r.diff_vs_us else None
     } for r in results])
     
     return df.sort_values(["Title", "Country"]).reset_index(drop=True)
@@ -476,45 +523,56 @@ with col6:
 
 st.markdown("---")
 
-if st.button("🚀 Pull Prices", type="primary", use_container_width=True):
-    # Parse inputs
+if st.button("🚀 Pull Prices", type="primary", width='stretch'):
+    # Parse inputs and fetch titles
     steam_games = []
-    for line in steam_input.strip().split("\n"):
-        if line.strip():
-            appid = extract_steam_appid(line)
-            if appid:
-                steam_games.append((appid, f"Steam Game {appid}"))
-    
     xbox_games = []
-    for line in xbox_input.strip().split("\n"):
-        if line.strip():
-            store_id = extract_xbox_store_id(line)
-            if store_id:
-                xbox_games.append((store_id, f"Xbox Game {store_id}"))
-    
     ps_games = []
-    for line in ps_input.strip().split("\n"):
-        if line.strip():
-            product_id = extract_ps_product_id(line)
-            if product_id:
-                ps_games.append((product_id, f"PS Game {product_id}"))
+    
+    with st.spinner("🔍 Validating game IDs and fetching titles..."):
+        # Process Steam
+        for line in steam_input.strip().split("\n"):
+            if line.strip():
+                appid = extract_steam_appid(line)
+                if appid:
+                    title = fetch_steam_title(appid)
+                    steam_games.append((appid, title))
+        
+        # Process Xbox
+        for line in xbox_input.strip().split("\n"):
+            if line.strip():
+                store_id = extract_xbox_store_id(line)
+                if store_id:
+                    title = fetch_xbox_title(store_id)
+                    xbox_games.append((store_id, title))
+        
+        # Process PlayStation
+        for line in ps_input.strip().split("\n"):
+            if line.strip():
+                product_id = extract_ps_product_id(line)
+                if product_id:
+                    title = fetch_ps_title(product_id)
+                    ps_games.append((product_id, title))
     
     if not steam_games and not xbox_games and not ps_games:
         st.error("Please enter at least one game for any platform.")
     else:
+        # Show what we're pulling
+        st.info(f"🎮 Pulling prices for: {len(steam_games)} Steam, {len(xbox_games)} Xbox, {len(ps_games)} PlayStation games")
+        
         with st.spinner("Fetching prices across all regions..."):
             rates = fetch_exchange_rates()
             steam_results, xbox_results, ps_results = pull_all_prices(
                 steam_games, xbox_games, ps_games
             )
         
-        st.success("✅ Price pull complete!")
+        st.success(f"✅ Price pull complete! Found {len(steam_results)} Steam, {len(xbox_results)} Xbox, {len(ps_results)} PlayStation prices")
         
         # Display Steam results
         if steam_results:
             st.markdown("### 🎮 Steam Regional Pricing")
             steam_df = process_results(steam_results, rates)
-            st.dataframe(steam_df, use_container_width=True, height=400)
+            st.dataframe(steam_df, width='stretch', height=400)
             st.download_button(
                 "⬇️ Download Steam CSV",
                 steam_df.to_csv(index=False).encode("utf-8"),
@@ -526,7 +584,7 @@ if st.button("🚀 Pull Prices", type="primary", use_container_width=True):
         if xbox_results:
             st.markdown("### 🎮 Xbox Regional Pricing")
             xbox_df = process_results(xbox_results, rates)
-            st.dataframe(xbox_df, use_container_width=True, height=400)
+            st.dataframe(xbox_df, width='stretch', height=400)
             st.download_button(
                 "⬇️ Download Xbox CSV",
                 xbox_df.to_csv(index=False).encode("utf-8"),
@@ -538,7 +596,7 @@ if st.button("🚀 Pull Prices", type="primary", use_container_width=True):
         if ps_results:
             st.markdown("### 🎮 PlayStation Regional Pricing")
             ps_df = process_results(ps_results, rates)
-            st.dataframe(ps_df, use_container_width=True, height=400)
+            st.dataframe(ps_df, width='stretch', height=400)
             st.download_button(
                 "⬇️ Download PlayStation CSV",
                 ps_df.to_csv(index=False).encode("utf-8"),
