@@ -438,4 +438,101 @@ def parse_json_ld(html: str) -> Tuple[Optional[str], Optional[float], Optional[s
     
     return None, None, None
 
-def fetch_ps_price_with_retry(product_id: str, country: str, title: str, max_retries: int = 3) -> Optional[PriceData
+def fetch_ps_price_with_retry(product_id: str, country: str, title: str, max_retries: int = 3) -> Optional[PriceData]:
+    """
+    v2.2: Fetch with retry logic for connection errors
+    Retries up to 3 times with exponential backoff
+    """
+    for attempt in range(max_retries):
+        try:
+            return fetch_ps_price_internal(product_id, country, title)
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries - 1:
+                wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
+                time.sleep(wait_time)
+                continue
+            else:
+                # Final attempt failed
+                debug_info = f"retry_failed_after_{max_retries}_attempts|{str(e)[:50]}"
+                return PriceData("PlayStation", title, country, 
+                               PLATFORM_CURRENCIES["PlayStation"].get(country, "USD"),
+                               None, None, None, "N/A", None, debug_info)
+    return None
+
+def fetch_ps_price_internal(product_id: str, country: str, title: str) -> Optional[PriceData]:
+    """v2.2: Aggressive price hunting with smart decimal conversion"""
+    if country not in PS_MARKETS:
+        return None
+    
+    locale = PS_MARKETS[country]
+    currency_code = PLATFORM_CURRENCIES["PlayStation"].get(country, "USD")
+    
+    headers = dict(PS_HEADERS)
+    if locale:
+        lang = locale.split("-")[0]
+        headers["Accept-Language"] = f"{lang}-{locale.split('-')[-1].upper()},{lang};q=0.8"
+    
+    debug_log = []
+    
+    # Increased timeout from 30s to 45s
+    url = f"https://store.playstation.com/{locale}/product/{product_id}"
+    resp = requests.get(url, headers=headers, timeout=45)
+    
+    if resp.status_code != 200:
+        debug_log.append(f"http_{resp.status_code}")
+        return PriceData("PlayStation", title, country, currency_code, None, None, None, "N/A", None, "|".join(debug_log))
+    
+    html = resp.text
+    debug_log.append("html_ok")
+    
+    # METHOD 1: Hunt for prices in entire HTML with regex
+    html_findings = hunt_prices_in_html(html)
+    if html_findings:
+        debug_log.append(f"regex_found_{len(html_findings)}_patterns")
+        for finding in html_findings:
+            base = _num(finding.get('basePrice'))
+            disc = _num(finding.get('discountedPrice'))
+            curr = finding.get('currencyCode', currency_code)
+            
+            if base and base > 0:
+                debug_log.append(f"base={base}|disc={disc}|src={finding['source']}")
+                debug_log.append("✓used_basePrice_regex")
+                full_debug = "|".join(debug_log)
+                print(f"[PSN Regex {country}] {title}: {base} {curr} (MSRP)")
+                return PriceData("PlayStation", title, country, curr, base, None, None, "MSRP", "regex_hunt", full_debug)
+            
+            if disc and disc > 0:
+                debug_log.append(f"disc={disc}|src={finding['source']}")
+                debug_log.append("⚠used_discountedPrice_regex")
+                full_debug = "|".join(debug_log)
+                return PriceData("PlayStation", title, country, curr, disc, None, None, "Sale Price", "regex_hunt", full_debug)
+    
+    # METHOD 2: Search all script tags
+    script_findings = search_all_scripts_for_prices(html)
+    if script_findings:
+        debug_log.append(f"scripts_found_{len(script_findings)}_patterns")
+        for finding in script_findings:
+            base = _num(finding.get('basePrice'))
+            if base and base > 0:
+                curr = finding.get('currencyCode', currency_code)
+                debug_log.append("✓used_basePrice_script")
+                full_debug = "|".join(debug_log)
+                print(f"[PSN Script {country}] {title}: {base} {curr} (MSRP)")
+                return PriceData("PlayStation", title, country, curr, base, None, None, "MSRP", "script_hunt", full_debug)
+    
+    # METHOD 3: Fallback to JSON-LD (will have sale prices)
+    t2, price2, curr2 = parse_json_ld(html)
+    if price2 is not None and price2 > 0:
+        debug_log.append("json_ld_fallback")
+        full_debug = "|".join(debug_log)
+        print(f"[PSN JSON-LD {country}] {title}: {price2} {curr2 or currency_code} (fallback)")
+        return PriceData("PlayStation", title, country, curr2 or currency_code, price2, None, None, "Current", "json_ld", full_debug)
+    
+    # All methods failed
+    debug_log.append("all_methods_failed")
+    full_debug = "|".join(debug_log)
+    print(f"[PSN {country}] {title}: FAILED - {full_debug}")
+    return PriceData("PlayStation", title, country, currency_code, None, None, None, "N/A", None, full_debug)
+
+# Main fetch function with retry
+fetch_ps_price = fetch_ps_price_with_retry
