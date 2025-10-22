@@ -1,8 +1,10 @@
 # multiplatform_pricing_tool_v2.2.py
-# FIXES: Decimal conversion (7999 → 79.99) + Retry logic for connection errors
-# - Converts cent values to proper decimals
-# - Retries failed requests up to 3 times with backoff
-# - Increased timeout to reduce connection failures
+# ENHANCED HYBRID APPROACH: HTML scraping + aggressive regex price hunting + DECIMAL FIXES
+# NEW IN v2.2:
+# - ✅ DECIMAL CONVERSION: Converts 7999 → 79.99 for EUR prices
+# - ✅ RETRY LOGIC: Exponential backoff with 3 retries on failures
+# - ✅ IMPROVED CURRENCY DETECTION: Better handling of currency symbols
+# - ✅ ROBUST PRICE PARSING: Handles more edge cases
 # - Steam and Xbox unchanged (working perfectly)
 
 import json
@@ -126,6 +128,17 @@ PLATFORM_CURRENCIES = {
     }
 }
 
+# Currencies that typically use 2 decimal places
+DECIMAL_CURRENCIES = {
+    "USD", "CAD", "EUR", "GBP", "AUD", "NZD", "SGD", "HKD", "MYR", "THB",
+    "PHP", "BRL", "ARS", "MXN", "CLP", "COP", "PEN", "UYU", "CRC", "CHF",
+    "NOK", "SEK", "DKK", "PLN", "CZK", "HUF", "TRY", "ILS", "SAR", "AED",
+    "QAR", "KWD", "ZAR", "UAH", "KZT", "RUB", "INR", "CNY", "TWD"
+}
+
+# Currencies that typically DON'T use decimals (yen-like currencies)
+NO_DECIMAL_CURRENCIES = {"JPY", "KRW", "VND", "IDR"}
+
 DEFAULT_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
@@ -182,39 +195,87 @@ def convert_to_usd(amount: Optional[float], currency: str, rates: Dict[str, floa
         return None
     return round(amount / rate, 2)
 
-def _num(x: Any) -> Optional[float]:
+def smart_price_conversion(raw_value: Any, currency: str) -> Optional[float]:
     """
-    Convert PlayStation's prices to numbers with smart decimal handling
-    "$79.99" → 79.99
-    "7999" (cents) → 79.99
+    v2.2 SMART CONVERSION: Intelligently converts price strings to floats
+    - Handles 7999 → 79.99 for decimal currencies (EUR, USD, etc.)
+    - Keeps 7999 → 7999 for non-decimal currencies (JPY, KRW, etc.)
+    - Handles currency symbols and formatting
     """
     try:
-        if x is None:
-            return None
-        if isinstance(x, (int, float)):
-            val = float(x)
-            # Smart decimal conversion: if >= 100 and no decimal, likely cents
-            if val >= 100 and val == int(val):
-                return round(val / 100, 2)
-            return val
-        
-        s = str(x).strip()
-        s = s.replace("$", "").replace("€", "").replace("£", "").replace("¥", "")
-        s = s.replace("₹", "").replace("R$", "").replace(",", "").strip()
-        
-        if not s:
+        if raw_value is None:
             return None
         
-        val = float(s)
-        
-        # Smart decimal conversion for values like "7999" (should be 79.99)
-        # Only apply if >= 100 and has no decimal point in original string
-        if val >= 100 and val == int(val) and '.' not in str(x):
-            return round(val / 100, 2)
+        # Already a number
+        if isinstance(raw_value, (int, float)):
+            value = float(raw_value)
+        else:
+            # Clean string: remove currency symbols and commas
+            s = str(raw_value).strip()
+            s = s.replace("$", "").replace("€", "").replace("£", "").replace("¥", "")
+            s = s.replace("₹", "").replace("R$", "").replace(",", "").replace(" ", "").strip()
             
-        return val
+            if not s:
+                return None
+            
+            value = float(s)
+        
+        # If value is zero or negative, return None
+        if value <= 0:
+            return None
+        
+        # Check if this currency uses decimals
+        if currency in NO_DECIMAL_CURRENCIES:
+            # Currencies like JPY, KRW - no decimal conversion needed
+            return round(value, 0)
+        
+        elif currency in DECIMAL_CURRENCIES:
+            # Currencies like EUR, USD - need decimal conversion
+            # If the value is > 100 and has no decimal point in original string
+            if value >= 100 and '.' not in str(raw_value):
+                # Likely missing decimal: 7999 → 79.99
+                value = value / 100.0
+                return round(value, 2)
+            else:
+                # Already has decimal or is small value
+                return round(value, 2)
+        
+        else:
+            # Unknown currency - assume it uses decimals
+            if value >= 100 and '.' not in str(raw_value):
+                value = value / 100.0
+            return round(value, 2)
+            
     except Exception:
         return None
+
+def _num(x: Any, currency: str = "USD") -> Optional[float]:
+    """Legacy wrapper that uses smart_price_conversion"""
+    return smart_price_conversion(x, currency)
+
+# ============================================================================
+# RETRY LOGIC
+# ============================================================================
+
+def retry_with_backoff(func, max_retries=3, initial_delay=1.0):
+    """
+    v2.2 RETRY LOGIC: Exponential backoff with jitter
+    Retries failed requests up to max_retries times with increasing delays
+    """
+    for attempt in range(max_retries):
+        try:
+            result = func()
+            return result
+        except Exception as e:
+            if attempt == max_retries - 1:
+                # Last attempt failed, raise the exception
+                raise e
+            
+            # Calculate delay with exponential backoff and jitter
+            delay = initial_delay * (2 ** attempt) + random.uniform(0, 1)
+            time.sleep(delay)
+    
+    return None
 
 # ============================================================================
 # STEAM (Unchanged)
@@ -315,7 +376,7 @@ def fetch_xbox_price(store_id: str, country: str, title: str) -> Optional[PriceD
     return PriceData("Xbox", title, country, currency, None, None, None, "API", "xbox_api")
 
 # ============================================================================
-# PLAYSTATION - v2.2 WITH DECIMAL FIX + RETRY LOGIC
+# PLAYSTATION - v2.2 WITH DECIMAL CONVERSION + RETRY LOGIC
 # ============================================================================
 
 def extract_ps_product_id(input_str: str) -> Optional[str]:
@@ -327,67 +388,100 @@ def extract_ps_product_id(input_str: str) -> Optional[str]:
         return match.group(1)
     return None
 
-def hunt_prices_in_html(html: str) -> List[Dict[str, Any]]:
-    """Aggressively search entire HTML for price patterns"""
+def hunt_prices_in_html(html: str, currency: str) -> List[Dict[str, Any]]:
+    """
+    v2.2 ENHANCED: Aggressively search entire HTML for price patterns
+    Now uses smart_price_conversion for decimal handling
+    Looking for: basePrice, discountedPrice in any format
+    Returns list of {basePrice, discountedPrice, currencyCode, source}
+    """
     findings = []
     
-    # Pattern for JSON objects containing basePrice
+    # Pattern 1: Search for basePrice:"$XX.XX" or basePrice:"€XX.XX" or basePrice:7999
+    base_pattern = r'basePrice["\s:]+(["\$€£¥₹R\s]*)([\d,]+\.?\d{0,2})'
+    base_matches = re.findall(base_pattern, html, re.IGNORECASE)
+    
+    # Pattern 2: Search for discountedPrice:"$XX.XX"
+    disc_pattern = r'discountedPrice["\s:]+(["\$€£¥₹R\s]*)([\d,]+\.?\d{0,2})'
+    disc_matches = re.findall(disc_pattern, html, re.IGNORECASE)
+    
+    # Pattern 3: Search for price objects in JSON format
+    # Looking for: {"basePrice":"$79.99","discountedPrice":"$55.99"}
+    # OR: {"basePrice":7999,"discountedPrice":5599}
     json_pattern = r'\{[^}]*basePrice[^}]*\}'
     json_matches = re.findall(json_pattern, html, re.IGNORECASE)
     
     for match in json_matches:
         try:
+            # Try to extract structured price data
             base_search = re.search(r'basePrice["\s:]+(["\$€£¥₹R\s]*)?([\d,]+\.?\d{0,2})', match)
             disc_search = re.search(r'discountedPrice["\s:]+(["\$€£¥₹R\s]*)?([\d,]+\.?\d{0,2})', match)
             curr_search = re.search(r'currencyCode["\s:]+["\']*([A-Z]{3})', match)
             
             if base_search or disc_search:
+                raw_base = base_search.group(2) if base_search else None
+                raw_disc = disc_search.group(2) if disc_search else None
+                detected_currency = curr_search.group(1) if curr_search else currency
+                
                 finding = {
-                    'basePrice': base_search.group(2) if base_search else None,
-                    'discountedPrice': disc_search.group(2) if disc_search else None,
-                    'currencyCode': curr_search.group(1) if curr_search else None,
-                    'source': 'regex_json_object'
+                    'basePrice': smart_price_conversion(raw_base, detected_currency),
+                    'discountedPrice': smart_price_conversion(raw_disc, detected_currency),
+                    'currencyCode': detected_currency,
+                    'source': 'regex_json_object',
+                    'raw_base': raw_base,
+                    'raw_disc': raw_disc
                 }
                 findings.append(finding)
         except Exception:
             continue
     
+    # If we found structured objects, return those
     if findings:
         return findings
     
-    # Fallback: separate pattern matching
-    base_pattern = r'basePrice["\s:]+(["\$€£¥₹R\s]*)([\d,]+\.?\d{0,2})'
-    disc_pattern = r'discountedPrice["\s:]+(["\$€£¥₹R\s]*)([\d,]+\.?\d{0,2})'
-    
-    base_matches = re.findall(base_pattern, html, re.IGNORECASE)
-    disc_matches = re.findall(disc_pattern, html, re.IGNORECASE)
-    
+    # Otherwise, try to pair basePrice and discountedPrice from separate matches
     if base_matches or disc_matches:
+        raw_base = base_matches[0][1] if base_matches else None
+        raw_disc = disc_matches[0][1] if disc_matches else None
+        
         finding = {
-            'basePrice': base_matches[0][1] if base_matches else None,
-            'discountedPrice': disc_matches[0][1] if disc_matches else None,
-            'currencyCode': None,
-            'source': 'regex_separate'
+            'basePrice': smart_price_conversion(raw_base, currency),
+            'discountedPrice': smart_price_conversion(raw_disc, currency),
+            'currencyCode': currency,
+            'source': 'regex_separate',
+            'raw_base': raw_base,
+            'raw_disc': raw_disc
         }
         findings.append(finding)
     
     return findings
 
-def search_all_scripts_for_prices(html: str) -> List[Dict[str, Any]]:
-    """Search ALL script tags for price data"""
+def parse_next_json(html: str) -> Optional[dict]:
+    """Parse Next.js JSON from script tags"""
+    soup = BeautifulSoup(html, "html.parser")
+    tag = soup.find("script", id="__NEXT_DATA__", type="application/json")
+    if tag and tag.string:
+        try:
+            return json.loads(tag.string)
+        except Exception:
+            pass
+    return None
+
+def search_all_scripts_for_prices(html: str, currency: str) -> List[Dict[str, Any]]:
+    """v2.2: Search ALL script tags for price data with smart conversion"""
     soup = BeautifulSoup(html, "html.parser")
     scripts = soup.find_all("script")
     
     all_findings = []
     for script in scripts:
         if script.string:
-            findings = hunt_prices_in_html(script.string)
+            findings = hunt_prices_in_html(script.string, currency)
             all_findings.extend(findings)
     
     return all_findings
 
-def parse_json_ld(html: str) -> Tuple[Optional[str], Optional[float], Optional[str]]:
-    """Parse JSON-LD structured data (fallback)"""
+def parse_json_ld(html: str, currency: str) -> Tuple[Optional[str], Optional[float], Optional[str]]:
+    """v2.2: Parse JSON-LD structured data (fallback) with smart conversion"""
     soup = BeautifulSoup(html, "html.parser")
     scripts = soup.find_all("script", type="application/ld+json")
     
@@ -415,57 +509,32 @@ def parse_json_ld(html: str) -> Tuple[Optional[str], Optional[float], Optional[s
                 offers = obj.get("offers")
                 
                 if isinstance(offers, dict):
-                    high_price = _num(offers.get("highPrice"))
+                    high_price = smart_price_conversion(offers.get("highPrice"), currency)
                     if high_price and high_price > 0:
-                        currency = offers.get("priceCurrency")
-                        return title, high_price, currency
-                    price = _num(offers.get("price"))
-                    currency = offers.get("priceCurrency")
+                        detected_currency = offers.get("priceCurrency") or currency
+                        return title, high_price, detected_currency
+                    price = smart_price_conversion(offers.get("price"), currency)
+                    detected_currency = offers.get("priceCurrency") or currency
                     if price is not None and price > 0:
-                        return title, price, currency
+                        return title, price, detected_currency
                 
                 elif isinstance(offers, list):
                     for off in offers:
                         if isinstance(off, dict):
-                            high_price = _num(off.get("highPrice"))
+                            high_price = smart_price_conversion(off.get("highPrice"), currency)
                             if high_price and high_price > 0:
-                                currency = off.get("priceCurrency")
-                                return title, high_price, currency
-                            price = _num(off.get("price"))
-                            currency = off.get("priceCurrency")
+                                detected_currency = off.get("priceCurrency") or currency
+                                return title, high_price, detected_currency
+                            price = smart_price_conversion(off.get("price"), currency)
+                            detected_currency = off.get("priceCurrency") or currency
                             if price is not None and price > 0:
-                                return title, price, currency
+                                return title, price, detected_currency
     
     return None, None, None
 
-def fetch_ps_price_with_retry(product_id: str, country: str, title: str, max_retries: int = 3) -> Optional[PriceData]:
-    """
-    v2.2: Fetch with retry logic for connection errors
-    Retries up to 3 times with exponential backoff
-    """
-    for attempt in range(max_retries):
-        try:
-            return fetch_ps_price_internal(product_id, country, title)
-        except requests.exceptions.RequestException as e:
-            if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 2  # 2s, 4s, 6s
-                time.sleep(wait_time)
-                continue
-            else:
-                # Final attempt failed
-                debug_info = f"retry_failed_after_{max_retries}_attempts|{str(e)[:50]}"
-                return PriceData("PlayStation", title, country, 
-                               PLATFORM_CURRENCIES["PlayStation"].get(country, "USD"),
-                               None, None, None, "N/A", None, debug_info)
-    return None
-
-def fetch_ps_price_internal(product_id: str, country: str, title: str) -> Optional[PriceData]:
-    """v2.2: Aggressive price hunting with smart decimal conversion"""
-    if country not in PS_MARKETS:
-        return None
-    
+def fetch_ps_price_attempt(product_id: str, country: str, title: str, currency_code: str) -> Optional[PriceData]:
+    """Single attempt to fetch PlayStation price - used by retry wrapper"""
     locale = PS_MARKETS[country]
-    currency_code = PLATFORM_CURRENCIES["PlayStation"].get(country, "USD")
     
     headers = dict(PS_HEADERS)
     if locale:
@@ -474,65 +543,323 @@ def fetch_ps_price_internal(product_id: str, country: str, title: str) -> Option
     
     debug_log = []
     
-    # Increased timeout from 30s to 45s
     url = f"https://store.playstation.com/{locale}/product/{product_id}"
-    resp = requests.get(url, headers=headers, timeout=45)
+    resp = requests.get(url, headers=headers, timeout=30)
     
     if resp.status_code != 200:
         debug_log.append(f"http_{resp.status_code}")
-        return PriceData("PlayStation", title, country, currency_code, None, None, None, "N/A", None, "|".join(debug_log))
+        raise Exception(f"HTTP {resp.status_code}")
     
     html = resp.text
     debug_log.append("html_ok")
     
     # METHOD 1: Hunt for prices in entire HTML with regex
-    html_findings = hunt_prices_in_html(html)
+    html_findings = hunt_prices_in_html(html, currency_code)
     if html_findings:
         debug_log.append(f"regex_found_{len(html_findings)}_patterns")
+        # Use first finding with basePrice
         for finding in html_findings:
-            base = _num(finding.get('basePrice'))
-            disc = _num(finding.get('discountedPrice'))
+            base = finding.get('basePrice')
+            disc = finding.get('discountedPrice')
             curr = finding.get('currencyCode', currency_code)
             
             if base and base > 0:
-                debug_log.append(f"base={base}|disc={disc}|src={finding['source']}")
+                debug_log.append(f"base={base}|raw={finding.get('raw_base')}|disc={disc}|src={finding['source']}")
                 debug_log.append("✓used_basePrice_regex")
                 full_debug = "|".join(debug_log)
-                print(f"[PSN Regex {country}] {title}: {base} {curr} (MSRP)")
+                print(f"[PSN v2.2 Regex {country}] {title}: {base} {curr} (MSRP from {finding['source']})")
                 return PriceData("PlayStation", title, country, curr, base, None, None, "MSRP", "regex_hunt", full_debug)
             
             if disc and disc > 0:
-                debug_log.append(f"disc={disc}|src={finding['source']}")
+                debug_log.append(f"disc={disc}|raw={finding.get('raw_disc')}|src={finding['source']}")
                 debug_log.append("⚠used_discountedPrice_regex")
                 full_debug = "|".join(debug_log)
                 return PriceData("PlayStation", title, country, curr, disc, None, None, "Sale Price", "regex_hunt", full_debug)
     
     # METHOD 2: Search all script tags
-    script_findings = search_all_scripts_for_prices(html)
+    script_findings = search_all_scripts_for_prices(html, currency_code)
     if script_findings:
         debug_log.append(f"scripts_found_{len(script_findings)}_patterns")
         for finding in script_findings:
-            base = _num(finding.get('basePrice'))
+            base = finding.get('basePrice')
             if base and base > 0:
                 curr = finding.get('currencyCode', currency_code)
-                debug_log.append("✓used_basePrice_script")
+                debug_log.append(f"base={base}|raw={finding.get('raw_base')}✓script")
                 full_debug = "|".join(debug_log)
-                print(f"[PSN Script {country}] {title}: {base} {curr} (MSRP)")
+                print(f"[PSN v2.2 Script {country}] {title}: {base} {curr} (MSRP)")
                 return PriceData("PlayStation", title, country, curr, base, None, None, "MSRP", "script_hunt", full_debug)
     
     # METHOD 3: Fallback to JSON-LD (will have sale prices)
-    t2, price2, curr2 = parse_json_ld(html)
+    t2, price2, curr2 = parse_json_ld(html, currency_code)
     if price2 is not None and price2 > 0:
         debug_log.append("json_ld_fallback")
         full_debug = "|".join(debug_log)
-        print(f"[PSN JSON-LD {country}] {title}: {price2} {curr2 or currency_code} (fallback)")
+        print(f"[PSN v2.2 JSON-LD {country}] {title}: {price2} {curr2 or currency_code} (fallback)")
         return PriceData("PlayStation", title, country, curr2 or currency_code, price2, None, None, "Current", "json_ld", full_debug)
     
     # All methods failed
     debug_log.append("all_methods_failed")
     full_debug = "|".join(debug_log)
-    print(f"[PSN {country}] {title}: FAILED - {full_debug}")
-    return PriceData("PlayStation", title, country, currency_code, None, None, None, "N/A", None, full_debug)
+    raise Exception(f"No price found: {full_debug}")
 
-# Main fetch function with retry
-fetch_ps_price = fetch_ps_price_with_retry
+def fetch_ps_price(product_id: str, country: str, title: str) -> Optional[PriceData]:
+    """v2.2: PlayStation price fetcher with RETRY LOGIC and DECIMAL CONVERSION"""
+    if country not in PS_MARKETS:
+        return None
+    
+    currency_code = PLATFORM_CURRENCIES["PlayStation"].get(country, "USD")
+    
+    try:
+        # Wrap the fetch attempt with retry logic
+        result = retry_with_backoff(
+            lambda: fetch_ps_price_attempt(product_id, country, title, currency_code),
+            max_retries=3,
+            initial_delay=1.0
+        )
+        return result
+    except Exception as e:
+        # All retries failed
+        debug_info = f"all_retries_failed|{str(e)[:100]}"
+        print(f"[PSN v2.2 {country}] {title}: FAILED after retries - {debug_info}")
+        return PriceData("PlayStation", title, country, currency_code, None, None, None, "N/A", None, debug_info)
+
+# ============================================================================
+# ORCHESTRATION
+# ============================================================================
+
+def pull_all_prices(steam_games: List[Tuple[str, str]], 
+                   xbox_games: List[Tuple[str, str]], 
+                   ps_games: List[Tuple[str, str]],
+                   max_workers: int = 20) -> Tuple[List[PriceData], List[PriceData], List[PriceData]]:
+    steam_results = []
+    xbox_results = []
+    ps_results = []
+    
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        for appid, title in steam_games:
+            for country in STEAM_MARKETS.keys():
+                futures.append((executor.submit(fetch_steam_price, appid, country, title), "steam"))
+        for store_id, title in xbox_games:
+            for country in XBOX_MARKETS.keys():
+                futures.append((executor.submit(fetch_xbox_price, store_id, country, title), "xbox"))
+        for product_id, title in ps_games:
+            for country in PS_MARKETS.keys():
+                futures.append((executor.submit(fetch_ps_price, product_id, country, title), "ps"))
+        
+        for future_tuple in futures:
+            future, platform = future_tuple
+            try:
+                result = future.result()
+                if result:
+                    if platform == "steam":
+                        steam_results.append(result)
+                    elif platform == "xbox":
+                        xbox_results.append(result)
+                    elif platform == "ps":
+                        ps_results.append(result)
+            except Exception:
+                pass
+    
+    return steam_results, xbox_results, ps_results
+
+def process_results(results: List[PriceData], rates: Dict[str, float]) -> pd.DataFrame:
+    if not results:
+        return pd.DataFrame()
+    
+    for r in results:
+        r.price_usd = convert_to_usd(r.price, r.currency, rates)
+    
+    us_prices = {}
+    for r in results:
+        if r.country == "US" and r.price_usd:
+            us_prices[r.title] = r.price_usd
+    
+    for r in results:
+        if r.price_usd and r.title in us_prices:
+            us_price = us_prices[r.title]
+            if us_price > 0:
+                pct = ((r.price_usd / us_price) - 1) * 100
+                r.diff_vs_us = f"{pct:+.1f}%"
+    
+    df_data = []
+    for r in results:
+        row = {
+            "Title": r.title,
+            "Country": COUNTRY_NAMES.get(r.country, r.country),
+            "Currency": r.currency,
+            "Local Price": r.price if r.price is not None else None,
+            "USD Price": r.price_usd if r.price_usd is not None else None,
+            "% Diff vs US": r.diff_vs_us if r.diff_vs_us else None
+        }
+        if DEBUG_MODE:
+            row["Price Type"] = r.price_type
+            row["Source"] = r.source
+            row["Debug Info"] = r.debug_info
+        df_data.append(row)
+    
+    df = pd.DataFrame(df_data)
+    return df.sort_values(["Title", "Country"]).reset_index(drop=True)
+
+# ============================================================================
+# STREAMLIT UI
+# ============================================================================
+
+st.title("🎮 Unified Multi-Platform Game Pricing Tool v2.2")
+st.caption("✨ NEW: Smart decimal conversion (7999→79.99) + Retry logic with exponential backoff!")
+
+if DEBUG_MODE:
+    st.info("🚀 **v2.2 Enhancements:** Decimal conversion for EUR prices + 3-retry system + Better price parsing")
+
+st.markdown("---")
+
+st.subheader("🎮 Steam Games")
+st.caption("Add games one per line: Title | AppID or URL")
+col1, col2 = st.columns([3, 1])
+with col1:
+    steam_input = st.text_area("Format: Game Title | AppID or URL", height=150, 
+                               placeholder="The Outer Worlds 2 | 1449110\nBorderlands 4 | 1285190")
+with col2:
+    st.markdown("**Examples:**")
+    st.code("Borderlands 4 | 1285190", language="text")
+    st.code("NBA 2K26 | 3472040", language="text")
+
+st.subheader("🎮 Xbox Games")
+st.caption("Add games one per line: Title | Store ID or URL")
+col3, col4 = st.columns([3, 1])
+with col3:
+    xbox_input = st.text_area("Format: Game Title | Store ID or URL", height=150,
+                             placeholder="The Outer Worlds 2 | 9NSPRSXXZZLG\nBorderlands 4 | 9MX6HKF5647G")
+with col4:
+    st.markdown("**Examples:**")
+    st.code("Borderlands 4 | 9MX6HKF5647G", language="text")
+    st.code("NBA 2K26 | 9PJ2RVRC0L1X", language="text")
+
+st.subheader("🎮 PlayStation Games")
+st.caption("Add games one per line: Title | Product ID or URL")
+col5, col6 = st.columns([3, 1])
+with col5:
+    ps_input = st.text_area("Format: Game Title | Product ID or URL", height=150,
+                           placeholder="Borderlands 4 | UP1001-PPSA01494_00-000000000000OAK2\nNBA 2K26 | UP1001-PPSA28420_00-NBA2K26000000000")
+with col6:
+    st.markdown("**Examples:**")
+    st.code("Borderlands 4 | UP1001-PPSA01494_00-...", language="text")
+    st.code("NBA 2K26 | UP1001-PPSA28420_00-...", language="text")
+
+st.markdown("---")
+
+if st.button("🚀 Pull Prices", type="primary", use_container_width=True):
+    steam_games = []
+    xbox_games = []
+    ps_games = []
+    
+    for line in steam_input.strip().split("\n"):
+        if "|" in line:
+            parts = line.split("|", 1)
+            title = parts[0].strip()
+            id_part = parts[1].strip()
+            appid = extract_steam_appid(id_part)
+            if appid:
+                steam_games.append((appid, title))
+        elif line.strip():
+            appid = extract_steam_appid(line)
+            if appid:
+                steam_games.append((appid, f"Steam Game {appid}"))
+    
+    for line in xbox_input.strip().split("\n"):
+        if "|" in line:
+            parts = line.split("|", 1)
+            title = parts[0].strip()
+            id_part = parts[1].strip()
+            store_id = extract_xbox_store_id(id_part)
+            if store_id:
+                xbox_games.append((store_id, title))
+        elif line.strip():
+            store_id = extract_xbox_store_id(line)
+            if store_id:
+                xbox_games.append((store_id, f"Xbox Game {store_id}"))
+    
+    for line in ps_input.strip().split("\n"):
+        if "|" in line:
+            parts = line.split("|", 1)
+            title = parts[0].strip()
+            id_part = parts[1].strip()
+            product_id = extract_ps_product_id(id_part)
+            if product_id:
+                ps_games.append((product_id, title))
+        elif line.strip():
+            product_id = extract_ps_product_id(line)
+            if product_id:
+                ps_games.append((product_id, f"PS Game {product_id}"))
+    
+    if not steam_games and not xbox_games and not ps_games:
+        st.error("Please enter at least one game for any platform.")
+    else:
+        st.info(f"🎮 Pulling prices for: {len(steam_games)} Steam, {len(xbox_games)} Xbox, {len(ps_games)} PlayStation games")
+        st.caption("✨ PlayStation v2.2: Smart decimal conversion + 3-attempt retry logic")
+        
+        with st.spinner("Fetching prices across all regions..."):
+            rates = fetch_exchange_rates()
+            steam_results, xbox_results, ps_results = pull_all_prices(steam_games, xbox_games, ps_games)
+        
+        st.success(f"✅ Price pull complete! Found {len(steam_results)} Steam, {len(xbox_results)} Xbox, {len(ps_results)} PlayStation prices")
+        
+        if steam_results:
+            st.markdown("### 🎮 Steam Regional Pricing")
+            steam_df = process_results(steam_results, rates)
+            st.dataframe(steam_df, use_container_width=True, height=400)
+            st.download_button("⬇️ Download Steam CSV", steam_df.to_csv(index=False).encode("utf-8"),
+                             "steam_prices.csv", "text/csv")
+        
+        if xbox_results:
+            st.markdown("### 🎮 Xbox Regional Pricing")
+            xbox_df = process_results(xbox_results, rates)
+            st.dataframe(xbox_df, use_container_width=True, height=400)
+            st.download_button("⬇️ Download Xbox CSV", xbox_df.to_csv(index=False).encode("utf-8"),
+                             "xbox_prices.csv", "text/csv")
+        
+        if ps_results:
+            st.markdown("### 🎮 PlayStation Regional Pricing")
+            ps_df = process_results(ps_results, rates)
+            st.dataframe(ps_df, use_container_width=True, height=400)
+            
+            if DEBUG_MODE:
+                st.markdown("**📊 v2.2 Smart Conversion Results:**")
+                
+                # Price Type breakdown
+                price_type_counts = ps_df['Price Type'].value_counts()
+                st.write("**Price Types:**")
+                st.write(price_type_counts)
+                
+                # Source breakdown
+                source_counts = ps_df['Source'].value_counts()
+                st.write("**Sources:**")
+                st.write(source_counts)
+                
+                # MSRP vs Sale count
+                msrp_count = (ps_df['Price Type'] == 'MSRP').sum()
+                sale_count = (ps_df['Price Type'] == 'Sale Price').sum()
+                current_count = (ps_df['Price Type'] == 'Current').sum()
+                na_count = (ps_df['Price Type'] == 'N/A').sum()
+                
+                col_a, col_b, col_c, col_d = st.columns(4)
+                with col_a:
+                    st.metric("✅ MSRP", msrp_count)
+                with col_b:
+                    st.metric("⚠️ Sale", sale_count)
+                with col_c:
+                    st.metric("📊 Current", current_count)
+                with col_d:
+                    st.metric("❌ Failed", na_count)
+                
+                if msrp_count > 0:
+                    st.success(f"🎉 v2.2 successfully found {msrp_count} MSRP prices with smart decimal conversion!")
+                elif current_count > 0:
+                    st.warning(f"⚠️ Found {current_count} prices via JSON-LD fallback (may be sale prices)")
+                else:
+                    st.error("❌ Price extraction failed - may need manual inspection")
+                
+                st.caption("📝 Check 'Debug Info' for conversion details (raw→converted) and 'Source' for extraction method")
+            
+            st.download_button("⬇️ Download PlayStation CSV", ps_df.to_csv(index=False).encode("utf-8"),
+                             "playstation_prices.csv", "text/csv")
